@@ -36,7 +36,7 @@ class IntConst(IntEnum):
 
 # Define floating point constants
 class FloatConst(float, Enum):
-    SIZE_FACTOR = 1.5         # Factor to increase the subset size for the AKAZE 
+    SIZE_FACTOR = 1.5         # Factor to increase the subset size for the AKAZE
                               # detection
 
 # Define some indices into the subSetPnts array
@@ -129,7 +129,7 @@ def _temporalMatch_(initSubSetPnts, imgSet, settings, resultsFile, externalRay=F
         - settings: A Settings object containing the settings for the DIC analysis.
         - resultsFile: The name of the file to store the results in.
         - externalRay: A boolean indicating whether to use an external ray server or not.
-        - guiThread: The GUI thread object if running from the GUI, otherwise None. Used to 
+        - guiThread: The GUI thread object if running from the GUI, otherwise None. Used to
                     cleanly stop the analysis if requested from the GUI.
 
     Returns:
@@ -324,7 +324,7 @@ def planarDICLocal(settings, resultsFile, externalRay=False, guiThread=None):
         - settings: A Settings object containing the settings for the DIC analysis.
         - resultsFile: The name of the file to store the results in.
         - externalRay: A boolean indicating whether to use an external ray server or not.
-        - guiThread: The GUI thread object if running from the GUI, otherwise None. Used to 
+        - guiThread: The GUI thread object if running from the GUI, otherwise None. Used to
                     cleanly stop the analysis if requested from the GUI.
 
     Returns:
@@ -368,7 +368,7 @@ def planarDICLocal(settings, resultsFile, externalRay=False, guiThread=None):
 
 # --------------------------------------------------------------------------------------------
 def _rmt_icOptimizationImpl(settings, iRowID, iColID, subSetPnts, activeSubsets,
-                             imgSet, img, guiThread=None):
+                            imgSet, img, guiThread=None):
     """
     Perform the IC optimization for a subset of points in a parallel environment.  This is a
     very thin wrapper for the icOptimization function that allows the function to be called
@@ -402,7 +402,7 @@ def _rmt_icOptimizationImpl(settings, iRowID, iColID, subSetPnts, activeSubsets,
 def _get_rmt_icOptimization():
     """
     Get the remote icOptimization implementation needed for Ray - we need this
-    wrapper to setup the remote function with the correct signature for Ray without 
+    wrapper to setup the remote function with the correct signature for Ray without
     having a dependency on Ray in the main code.
 
     Returns:
@@ -504,7 +504,7 @@ def _setupSubSets_(subSetSize, stepSize, shapeFn, ROI, img0, debugLevel=0):
     nRowsCand, nColsCand = yCand.shape
     nCandidates = nRowsCand * nColsCand
 
-    # Only place subsets at points where the full nominal subset size fits within the 
+    # Only place subsets at points where the full nominal subset size fits within the
     # image bounds.
 
     # If subSetSize is an array, extract the maximum values for the first row, the last row,
@@ -518,10 +518,10 @@ def _setupSubSets_(subSetSize, stepSize, shapeFn, ROI, img0, debugLevel=0):
         xStart = max(xOrigin, int(0.5 * (xMinMax - 1)))
         yStart = max(yOrigin, int(0.5 * (yMinMax - 1)))
         xStop = min(xBound, imgW - int(0.5 * (xMaxMax - 1)))
-        yStop = min(yBound, imgH - int(0.5 * (yMaxMax - 1)))        
+        yStop = min(yBound, imgH - int(0.5 * (yMaxMax - 1)))
     else:
         half = int(0.5 * (subSetSize - 1))
-        
+
         xStart = max(xOrigin, half)
         yStart = max(yOrigin, half)
         xStop = min(xBound, imgW - half)
@@ -714,8 +714,8 @@ def _relativeCoords_(subSetSize, cache):
     Generate relative/local coordinates of pixels within the subset.  The coordinates are
     generated based on the subset size with one point for each pixel in the subset.
 
-    This version is a cached version of the function to avoid redundant generation of the 
-    coordinates for each subset.  The coordinates are generated once for each unique subset 
+    This version is a cached version of the function to avoid redundant generation of the
+    coordinates for each subset.  The coordinates are generated once for each unique subset
     size and stored in a cache.  This speedsup the code significantly.
 
     Parameters:
@@ -727,11 +727,11 @@ def _relativeCoords_(subSetSize, cache):
     """
     # Create cache key
     cache_key = (int(subSetSize))
-    
+
     # Return cached result if available
     if cache_key in cache:
         return cache[cache_key]
-    
+
     # Otherwise compute it (original logic)
     coords = np.linspace(-0.5*(subSetSize-1), 0.5*(subSetSize-1), subSetSize)
     eta, xsi = np.meshgrid(coords, coords, indexing='ij')
@@ -740,7 +740,7 @@ def _relativeCoords_(subSetSize, cache):
 
     # Setup the result
     result = (None, xsi_flat, eta_flat)
-    
+
     # Store in cache
     cache[cache_key] = result
 
@@ -769,7 +769,7 @@ def _icOptimization_(settings, subSetPnts, activeSubsets, imgSet, img, guiThread
         - ValueError: If an invalid optimization algorithm is specified.
     """
 
-    # Reset cache at start of each image pair - not really needed for the relative 
+    # Reset cache at start of each image pair - not really needed for the relative
     # coordinates
     _cznssd_cache = {}
     _relativeCoords_cache = {}
@@ -1049,7 +1049,7 @@ def _icOptimization_(settings, subSetPnts, activeSubsets, imgSet, img, guiThread
 
         # Find the next point to iterate to
         nextPnt, subSetPnts = _getNextPnt_(nextPnt, subSetPnts, activeSubsets,
-                                            analyze, F, G, GInter, nBGCutOff, 
+                                            analyze, F, G, GInter, nBGCutOff,
                                           _cznssd_cache, _relativeCoords_cache)
         if nextPnt is None:
             break
@@ -1061,7 +1061,7 @@ def _icOptimization_(settings, subSetPnts, activeSubsets, imgSet, img, guiThread
 def _processImage_(imgSet, img, gaussBlur, interOrder, isDatumImg, isNormalized):
     """
     Process an image to obtain DIC specific parameters.  If this is the datum image
-    the gradient of the image is also calculated and no interpolation is setup.  
+    the gradient of the image is also calculated and no interpolation is setup.
     Otherwise, only the image and the interpolated image is calculated.
 
     Paramters:
@@ -1077,7 +1077,7 @@ def _processImage_(imgSet, img, gaussBlur, interOrder, isDatumImg, isNormalized)
     Returns:
         tuple: A tuple containing the processed image and related data.
             - F (numpy.ndarray): The processed image.
-            - F_interpolated (numpy.ndarray): The interpolated image (or the processed 
+            - F_interpolated (numpy.ndarray): The interpolated image (or the processed
                 image if isDatumImg is True).
             - delF (numpy.ndarray or None): The gradient of the image in the
                 x and y directions, or None if isDatumImg is False.
@@ -1139,20 +1139,20 @@ def _processImage_(imgSet, img, gaussBlur, interOrder, isDatumImg, isNormalized)
 
 # ---------------------------------------------------------------------------------------------
 # Optimized _getNextPnt_ function with caching and vectorized interpolation
-# For now both versions are kept until we are confident the optimized version is stable 
+# For now both versions are kept until we are confident the optimized version is stable
 # and provides significant speedup across a range of settings and image types
 def _getNextPnt_(currentPnt, subSetPnts, activeSubsets, analyzed, F, G, GInter,
                            nBGCutOff, cznssd_cache, relativeCoords_cache):
     """
-    Get the next point to analyze in the optimization algorithm (OPTIMIZED VERSION). The 
-    next point is selected based on updated, estimated CZNSSD values for points the current 
+    Get the next point to analyze in the optimization algorithm (OPTIMIZED VERSION). The
+    next point is selected based on updated, estimated CZNSSD values for points the current
     point and the current deformation model.
-    
+
     This optimized version includes:
     1. Caching of CZNSSD values to avoid redundant computations
     2. Vectorized interpolation calls to reduce function call overhead
     3. Early termination when improvements plateau
-    
+
     Parameters:
         - currentPnt (tuple): The index of the current point - tuple with iRow and ICol.
         - subSetPnts (numpy.ndarray): The subSetPnts data structure - 3D array that contains
@@ -1201,14 +1201,14 @@ def _getNextPnt_(currentPnt, subSetPnts, activeSubsets, analyzed, F, G, GInter,
     all_xsi_d = []
     all_eta_d = []
     all_neighbor_info = []  # Store (row, col, x0, y0, f_info, etc.)
-    
+
     # First pass: collect all neighbors and their coordinate transformations
     for idx, (r, c) in enumerate(neighbors[:IntConst.MAX_NEIGHBORS]):
-        
+
         # Skip if already analyzed
         if analyzed[r, c]:
             continue
-        
+
         # The current point and its coordinates
         x0 = int(subSetPnts[r, c, CompID.XCoordID])
         y0 = int(subSetPnts[r, c, CompID.YCoordID])
@@ -1250,20 +1250,20 @@ def _getNextPnt_(currentPnt, subSetPnts, activeSubsets, analyzed, F, G, GInter,
         # Concatenate all coordinates for batch interpolation
         all_yd = []
         all_xd = []
-        
+
         for info, xsi_d, eta_d in zip(all_neighbor_info, all_xsi_d, all_eta_d):
             yd = info['y0'] + eta_d
             xd = info['x0'] + xsi_d
             all_yd.append(yd)
             all_xd.append(xd)
-        
+
         # Concatenate all coordinates
         all_yd_concat = np.concatenate(all_yd)
         all_xd_concat = np.concatenate(all_xd)
-        
+
         # Single vectorized interpolation call instead of individual calls
         all_g_concat = GInter(all_yd_concat.reshape(-1, 1), all_xd_concat.reshape(-1, 1))
-        
+
         # Split results back to individual neighbors
         idx_offset = 0
         for neighbor_idx, info in enumerate(all_neighbor_info):
@@ -1275,9 +1275,9 @@ def _getNextPnt_(currentPnt, subSetPnts, activeSubsets, analyzed, F, G, GInter,
             # Cache CZNSSD results
             # ========================================================================================
             # Create a cache key (avoid using entire array as key - use tuple of params)
-            cache_key = (info['row'], info['col'], 
+            cache_key = (info['row'], info['col'],
                         tuple(subSetPnts[info['row'], info['col'], CompID.XDispID:]))
-            
+
             # Check if we have this in cache
             if cache_key in cznssd_cache:
                 newCZNSSD = cznssd_cache[cache_key]
@@ -1285,17 +1285,17 @@ def _getNextPnt_(currentPnt, subSetPnts, activeSubsets, analyzed, F, G, GInter,
                 # Calculate deformed subset info
                 g_mean = g.mean()
                 g_tilde = np.linalg.norm(g - g_mean)
-                
+
                 # Get the CZNSSD value
                 newCZNSSD = _calcCZNSSD_(nBGCutOff, info['f'], info['f_mean'],
                                         info['f_tilde'], g, g_mean, g_tilde)
-                
+
                 # Store in cache
                 cznssd_cache[cache_key] = newCZNSSD
 
             # Get the old CZNSSD value
             oldCZNSSD = subSetPnts[info['row'], info['col'], CompID.CZNSSDID]
-            
+
             # Store the CZNSSD value if it's better
             if newCZNSSD < oldCZNSSD:
                 subSetPnts[info['row'], info['col'], CompID.XDispID:] = \
@@ -1333,7 +1333,7 @@ def _getStartingPnt_(subSetPnts, activeSubsets, nGQPoints, F, G, GInter, nBGCutO
         - G (numpy.ndarray): The train image.
         - GInter (numpy.ndarray): The interpolated train image.
         - nBGCutOff (int): The cutoff value to detect all black backgrounds.
-        - relativeCoords_cache (dict): Cache dictionary for relative coordinates to 
+        - relativeCoords_cache (dict): Cache dictionary for relative coordinates to
             avoid redundant calculations.
 
     Returns:
@@ -1382,7 +1382,7 @@ def _getStartingPnt_(subSetPnts, activeSubsets, nGQPoints, F, G, GInter, nBGCutO
         # Impose the deformation model on the subset and get the reference and deformed
         # subset information
         iRow, iCol = it.multi_index
-        
+
         # Deal with inactive subsets - set the CZNSSD value to max and skip the rest of the loop
         if not adActive[iRow, iCol]:
             adPoints[iRow, iCol, CompID.CZNSSDID] = IntConst.CNZSSD_MAX
@@ -2111,7 +2111,7 @@ def _fillMissingData_(dataX, dataY, dataVal):
     # Handle case where all values are NaN
     if np.isnan(dataVal).all():
         return dataVal
-    
+
     # Check if there are NaN values to interpolate
     if np.isnan(dataVal).any():
 
@@ -2317,7 +2317,7 @@ def _loadMask_(maskFile, expectedShape):
     Raises:
         FileNotFoundError: If the mask file is not found or cannot be read.
         ValueError: If the mask shape does not match the expected shape.
-    
+
     Returns:
         numpy.ndarray: A boolean array where True indicates valid pixels according to the mask.
     """
@@ -2332,7 +2332,7 @@ def _loadMask_(maskFile, expectedShape):
             f"Mask shape {mask.shape} does not match image shape {expectedShape}.\n \
 Please ensure the mask has the same dimensions as the input image."
         )
-    
+
     # Use thresholding to convert the mask to a binary mask (in case it is not already binary)
     _, mask = cv.threshold(mask, 127, 255, cv.THRESH_BINARY)
 
@@ -2346,7 +2346,7 @@ def _buildActiveSubsetsMask_(subSetPnts, roiMask):
 
     Parameters:
     - subSetPnts (numpy.ndarray): An array of shape (nRows, nCols, nComponents) containing the coordinates of the subset points.
-    - roiMask (numpy.ndarray): A binary mask where True indicates valid pixels. 
+    - roiMask (numpy.ndarray): A binary mask where True indicates valid pixels.
 
     Returns:
         numpy.ndarray: A boolean array indicating the active subset.
@@ -2363,7 +2363,7 @@ def _applyInactiveSubsets_(subSetPnts, activeSubsets):
     maximum and the displacements to NaN for inactive subsets.
 
     Parameters:
-    - subSetPnts (numpy.ndarray): An array of shape (nRows, nCols, nComponents) containing the 
+    - subSetPnts (numpy.ndarray): An array of shape (nRows, nCols, nComponents) containing the
         coordinates of the subset points.
     - activeSubsets (numpy.ndarray): A boolean array indicating the active subsets.
 

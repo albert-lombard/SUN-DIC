@@ -6,21 +6,19 @@ from enum import IntEnum
 
 import cv2 as cv
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
 import natsort as ns
 import numpy as np
 import sundic.sundic as sdic
-from sundic.sundic import CompID, IntConst
+from sundic.sundic import CompID, IntConst, ShapeFN
 from scipy.interpolate import griddata
 import sundic.post_process as sdpp
-from skimage.exposure import match_histograms
-import ray as ray
+import sundic.stereo_calibrate as sc
+# from skimage.exposure import match_histograms
+import ray
 from concurrent.futures import ThreadPoolExecutor
 
-from sundic.util.fast_interp import interp2d
 import sundic.util.datafile as dataFile
-from scipy.interpolate import NearestNDInterpolator
-from sundic.util.savitsky_golay import sgolay2d
-from skimage.exposure import match_histograms
 
 # Modify the subset array indices to include z-coordinates and diplacements
 class CompID(IntEnum):
@@ -33,6 +31,7 @@ class CompID(IntEnum):
     YDispID = 11  # The y-displacement of the subset point - start of y model coefficients
     ZCoordID = 17   # The z-coordinate of the subset center point
     ZDispID = 18   # The z-displacement of the subset point - start of z model coefficients
+
 
 # TODO: Check if there are any images
 def getStereoImageList(folderPath, debugLevel=0):
@@ -119,6 +118,7 @@ def getStereoImageList(folderPath, debugLevel=0):
 
 from scipy.spatial.transform import Rotation as Rscipy
 
+
 def _triangulatePoints_(leftPts, rightPts, calData):
     """
     Triangulate a 3D points from corresponding set of 2D points.
@@ -150,16 +150,16 @@ def _triangulatePoints_(leftPts, rightPts, calData):
         rightPts = rightPts.reshape(-1, 1, 2)
 
     # Undistort the  points using the distortion coefficients
-    pts1 = cv.undistortPoints(leftPts, K1, D1)
-    pts2 = cv.undistortPoints(rightPts, K2, D2)
+    pts1 = cv.undistortPoints(leftPts, K1, D1, P=K1)
+    pts2 = cv.undistortPoints(rightPts, K2, D2, P=K2)
 
     # Reshape to (2, N) for triangulation
     pts1 = pts1.reshape(-1, 2).T
     pts2 = pts2.reshape(-1, 2).T
 
     # Build projection matrices
-    P1 = np.hstack((np.eye(3), np.zeros((3, 1))))     # [I | 0]
-    P2 = np.hstack((R, T))                            # [R | T]
+    P1 = K1 @ np.hstack((np.eye(3), np.zeros((3, 1))))     # K1 * [I | 0]
+    P2 = K2 @ np.hstack((R, T))                            # K2 * [R | T]
 
     # Triangulate homogeneous 3D points
     points_hom = cv.triangulatePoints(P1, P2, pts1, pts2)  # shape: (4, N)
@@ -168,6 +168,7 @@ def _triangulatePoints_(leftPts, rightPts, calData):
     points_3d = cv.convertPointsFromHomogeneous(points_hom.T)
 
     return points_3d.squeeze()
+
 
 def _triangulateSubSets_(leftSubSetPnts, rightSubSetPnts, calData):
     """
@@ -227,6 +228,7 @@ def _triangulateSubSets_(leftSubSetPnts, rightSubSetPnts, calData):
 
     return worldSubSetPnts
 
+
 def _fillMissingSubsets_(subSetPnts, method='cubic'):
     """
     Fill NaNs in X and Y coordinate fields of subSetPnts using grid interpolation.
@@ -249,6 +251,7 @@ def _fillMissingSubsets_(subSetPnts, method='cubic'):
             data[~mask] = griddata(known_points, known_values, interp_points, method=method)
             subSetPnts[:, :, coord_id] = data
     return subSetPnts
+
 
 def _resizeSubSetArray_(subset_array, required_size):
     """
@@ -286,7 +289,89 @@ def _resizeSubSetArray_(subset_array, required_size):
     # If no resize is needed, return the original array
     return subset_array
 
-def stereoMatch(settings, leftImg, rightImg, fillMissing=False):
+def _getEpipolarMask_(Pnts1, Pnts2, calData, Threshold=2.0):
+    """
+    Computes a mask for corresponding points that fall within a threshold distance
+    from their epipolar line constraints.
+
+    Parameters:
+        - Pnts1, Pnts2 (Nx2, ndarray), Arrays of corresponding 2D points.
+        - calData (dict): Dictionary with stereo calibration data.
+        - Threshold (float): Maximum pixel distance from epipolar lines.
+                             Defaults to 2.0 pixels.
+
+    """
+    # Extract the Fundamental matrix
+    F = calData["F"]
+
+    # Compute the epipolar lines in image 1 for points in image 2
+    # Computes ax + by + c = 0 for each point in Nx3 array
+    Lines1 = cv.computeCorrespondEpilines(Pnts2, 2, F)
+    Lines1 = Lines1.reshape(-1, 3)
+
+    # Calculate the distances from Pnts1 to Lines1
+    # Distance formula: |ax + by + c | / sqrt(a^2 + b^2)
+    num1 = np.abs(Lines1[:,0] * Pnts1[:,0] + Lines1[:,1] * Pnts1[:,1] + Lines1[:,2])
+    den1 = np.sqrt(Lines1[:,0]**2 + Lines1[:,1]**2)
+    dist1 = num1 / den1
+
+    # Compute the epipolar lines in image 2 for points in image 1
+    # Computes ax + by + c = 0 for each point in Nx3 array
+    Lines2 = cv.computeCorrespondEpilines(Pnts1, 1, F)
+    Lines2 = Lines2.reshape(-1, 3)
+
+    # Calculate the distances from Pnts2 to Lines2
+    # Distance formula: |ax + by + c | / sqrt(a^2 + b^2)
+    num2 = np.abs(Lines2[:,0] * Pnts2[:,0] + Lines2[:,1] * Pnts2[:,1] + Lines2[:,2])
+    den2 = np.sqrt(Lines2[:,0]**2 + Lines2[:,1]**2)
+    dist2 = num2 / den2
+
+    # Use the maximum of the two as the error
+    error = np.maximum(dist1, dist2)
+
+    # Create boolean mask based on threshold
+    mask = (error < Threshold).astype(np.uint8)
+
+    return mask
+
+def filter_outliers_iqr(points_3d, factor=1.5):
+    """
+    Filters points based on the Interquartile Range (IQR) of their Z-coordinates.
+    factor: 1.5 is standard, 1.0 is aggressive, 2.0 is conservative.
+    """
+    z = points_3d[:, 2]
+    q25, q75 = np.percentile(z, [25, 75])
+    iqr = q75 - q25
+
+    lower_bound = q25 - (factor * iqr)
+    upper_bound = q75 + (factor * iqr)
+
+    mask = ((z >= lower_bound) & (z <= upper_bound)).astype(np.uint8)
+    return mask
+
+from scipy.spatial import KDTree
+def filter_outliers_sor(points_3d, k=15, std_ratio=1.0):
+    """
+    Statistical Outlier Removal (SOR).
+    k: Number of nearest neighbors to evaluate.
+    std_ratio: Standard deviation multiplier threshold.
+    """
+    tree = KDTree(points_3d)
+    # Query distance to k nearest neighbors
+    distances, _ = tree.query(points_3d, k=k+1)
+
+    # Average distance to neighbors (excluding self at index 0)
+    mean_distances = np.mean(distances[:, 1:], axis=1)
+
+    # Calculate threshold based on global distribution
+    global_mean = np.mean(mean_distances)
+    global_std = np.std(mean_distances)
+    threshold = global_mean + (std_ratio * global_std)
+
+    mask = (mean_distances < threshold).astype(np.uint8)
+    return mask
+
+def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     """
     Perform stereo matching between the leftImg (reference) and rightImg
     (target), and return the leftSubSetPnts for the leftImg and the matched
@@ -316,7 +401,7 @@ def stereoMatch(settings, leftImg, rightImg, fillMissing=False):
     tempFolderPath = os.path.join(os.getcwd(), "sm_temp")
     if os.path.exists(tempFolderPath):
         shutil.rmtree(tempFolderPath)
-    os.makedirs(tempFolderPath, exist_ok=True)
+        os.makedirs(tempFolderPath, exist_ok=True)
 
     # Check if left and right images exist
     if not os.path.exists(leftImg) or not os.path.exists(rightImg):
@@ -341,15 +426,128 @@ def stereoMatch(settings, leftImg, rightImg, fillMissing=False):
     # 2. DIC Analysis
     sm_settings.ImageFolder = tempFolderPath
     # sm_settings.ShapeFunctions = "Quadratic"
-    sm_settings.CPUCount = 1       # Multiproccessing currently broken for stereo matching
+    # sm_settings.CPUCount = 1       # TODO: Multiproccessing currently broken for stereo matching
     sm_settings.ReferenceStrategy = "Absolute"
     sm_settings.DatumImage = 0
     sm_settings.TargetImage = -1
     sm_settings.Increment = 1
     resultsPath = os.path.join(tempFolderPath, "sm_results.sdic")
 
-    # Perform planar DIC to get subset coordinates and displacements
-    returnData = sdic.planarDICLocal(sm_settings, resultsPath)
+    # Get the Region of Interest (ROI) for the left image
+    ROI = sdic._setupROI_(sm_settings.ROI, [leftImg, rightImg], debugLevel=sm_settings.DebugLevel)
+
+    # Create the initial subsets for the left image
+    subSetSize = sm_settings.SubsetSize
+    stepSize = sm_settings.StepSize
+    shapeFn = sm_settings.ShapeFunctions
+    initSubSetPnts_left = sdic._setupSubSets_(
+        subSetSize, stepSize, shapeFn, ROI, leftImg, debugLevel=sm_settings.DebugLevel)
+    if initSubSetPnts_left.size == 0:
+        raise ValueError("No valid subset centers could be created for the specified ROI/subset size.")
+
+    # plotSubSetsOnImage(leftImg,
+    #                    initSubSetPnts_left,
+    #                    applyDeformation=True,
+    #                    showCenters=True,
+    #                    maxSubSets=None,
+    #                    fileName="subsets.png",
+    #                    showPlot=True)
+
+    # -------------------------------------------------------------------
+    # Apply perspective transformation using AKAZE depth estimation
+    # -------------------------------------------------------------------
+    # Check if calData is present
+    if calData is None:
+        raise ValueError("Calibration data ('calData') is incorrect or missing.")
+
+    # 1. Load images for AKAZE feature detection
+    left_img_gray = sdic.readImage(leftImg)
+    right_img_gray = sdic.readImage(rightImg)
+
+    # Create a binary mask for the left image based on the ROI
+    # ROI format from _setupROI_ is [XStart, YStart, XLength, YLength]
+    x_start, y_start, w, h = ROI
+    left_mask = np.zeros_like(left_img_gray, dtype=np.uint8)
+    left_mask[y_start:y_start+h, x_start:x_start+w] = 255
+
+    # 2. Detect AKAZE features
+    akaze = cv.xfeatures2d.AKAZE_create()
+    # akaze = cv.SIFT.create()
+    kp1, desc1 = akaze.detectAndCompute(left_img_gray, mask=left_mask)
+    kp2, desc2 = akaze.detectAndCompute(right_img_gray, mask=None)
+
+    if desc1 is not None and desc2 is not None and len(kp1) > 0 and len(kp2) > 0:
+        # Match features
+        matcher = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
+        # matcher = cv.BFMatcher(cv.NORM_L2, crossCheck=True)
+        matches = matcher.match(desc1, desc2)
+
+        if len(matches) >= 8:  # Need at least _ points for affine and _ points for quadratic
+            # Extract coordinates of matches
+            akaze_pts_left = np.array([kp1[m.queryIdx].pt for m in matches])
+            akaze_pts_right = np.array([kp2[m.trainIdx].pt for m in matches])
+
+            # Filter outlier matches using epipolar constraints
+            mask_epipolar = _getEpipolarMask_(akaze_pts_left, akaze_pts_right, calData, Threshold=2.0)
+            # breakpoint()
+
+            if mask_epipolar is not None and np.sum(mask_epipolar) > 0:
+                akaze_pts_left = akaze_pts_left[mask_epipolar.ravel() == 1]
+                akaze_pts_right = akaze_pts_right[mask_epipolar.ravel() == 1]
+
+                # Triangulate matched points to get actual 3D depths
+                points_3d = _triangulatePoints_(akaze_pts_left, akaze_pts_right, calData)
+
+                # Filter outliers
+                mask_sor = filter_outliers_sor(points_3d, k=5, std_ratio=1.0)
+                points_3d = points_3d[mask_sor.ravel() == 1]
+
+                # plotPoints3D(points_3d, fileName="points_3d.png", showPlot=True, set_aspect="equal")
+                # # Use median Z to ignore remaining outliers
+                # Z_guess = np.nanmedian(points_3d[:, 2])
+
+                # if sm_settings.DebugLevel >= 1:
+                #     print(f"AKAZE: Estimated specimen depth (Z) = {Z_guess:.2f}")
+            else:
+                if sm_settings.DebugLevel >= 1:
+                    print("AKAZE: epipolar filtering failed.")
+        else:
+            if sm_settings.DebugLevel >= 1:
+                print("AKAZE: Not enough matches found.")
+
+    # # 3. Extract the 2D coordinates from the left subsets
+    # pts_left = np.stack((
+    #     initSubSetPnts_left[:, :, CompID.XCoordID].flatten(),
+    #     initSubSetPnts_left[:, :, CompID.YCoordID].flatten()
+    # ), axis=1).astype(np.float32)
+
+    # # 4. Undistort points to normalized camera coordinates (rays)
+    # K1, D1 = calData["K1"], calData["D1"]
+    # K2, D2 = calData["K2"], calData["D2"]
+    # R, T = calData["R"], calData["T"]
+    # pts_left_norm = cv.undistortPoints(pts_left, K1, D1).reshape(-1, 2)
+
+    # # 5. Convert normalized rays to 3D points using our AKAZE-estimated Z
+    # pts_3d_left = np.hstack((pts_left_norm, np.ones((pts_left_norm.shape[0], 1)))) * Z_guess
+
+    # # 6. Project the 3D points onto the right camera's image plane
+    # pts_right_proj, _ = cv.projectPoints(pts_3d_left, R, T, K2, D2)
+    # pts_right_proj = pts_right_proj.reshape(-1, 2)
+
+    # # 7. Apply the projected coordinates to the right subset array
+    # initSubSetPnts_right = np.copy(initSubSetPnts_left)
+    # data_shape = initSubSetPnts_left[:, :, CompID.XCoordID].shape
+
+    # initSubSetPnts_right[:, :, CompID.XCoordID] = pts_right_proj[:, 0].reshape(data_shape)
+    # initSubSetPnts_right[:, :, CompID.YCoordID] = pts_right_proj[:, 1].reshape(data_shape)
+    # # -------------------------------------------------------------------
+
+    # breakpoint()
+    initSubSetPnts_right = initSubSetPnts_left
+
+    # Perform temporal matching to get the right image subset coordinates and
+    # displacements
+    returnData = sdic._temporalMatch_(initSubSetPnts_right, [leftImg, rightImg], sm_settings, resultsPath)
     rightSubSetPnts = np.copy(returnData[0])
     leftSubSetPnts = np.copy(returnData[0])
 
@@ -378,6 +576,16 @@ def stereoMatch(settings, leftImg, rightImg, fillMissing=False):
         if sm_settings.DebugLevel >= 1:
             print("Filled in missing subsets for right image.")
 
+    # plotSubSetsOnImage(rightImg,
+    #                    rightSubSetPnts,
+    #                    applyDeformation=True,
+    #                    showCenters=True,
+    #                    maxSubSets=None,
+    #                    fileName="subsets.png",
+    #                    showPlot=True)
+
+    # breakpoint()
+
     # Force all the subset point coordinates to be ints
     # Warning, may cause errors. Update: Did cause major errors
     # rightSubSetPnts[:, :, CompID.XCoordID] = np.round(rightSubSetPnts[:, :, CompID.XCoordID])
@@ -389,202 +597,6 @@ def stereoMatch(settings, leftImg, rightImg, fillMissing=False):
 
     return leftSubSetPnts, rightSubSetPnts
 
-def temporalMatch(initSubSetPnts, imgSet, settings, resultsFile, externalRay=False, guiThread=None):
-    """
-    Perform local planar (2D) Digital Image Correlation (DIC) analysis.
-
-    This function takes a dictionary of settings as input and performs local DIC analysis
-    based on the specified settings. The analysis involves processing a series of image pairs
-    to obtain displacement and strain data.
-
-    Parameters:
-        - settings: A Settings object containing the settings for the DIC analysis.
-        - resultsFile: The name of the file to store the results in.
-        - externalRay: A boolean indicating whether to use an external ray server or not.
-        - guiThread: The GUI thread object if running from the GUI, otherwise None. Used to
-                    cleanly stop the analysis if requested from the GUI.
-
-    Returns:
-        - returnData (list): A list of subSetPoint arrays. Each subSetPoint array is a
-            3D matrix where the first plane contains the x-coordinates
-            the second plane the y-coordinates and the remaining planes the subset size,
-            shapeFn, CZNSSD value and model coefficients.  This array can be processed to
-            obtain displacement and strain data and to generate graphs.
-
-    Raises:
-        - ValueError: If an invalid optimization algorithm is specified.
-    """
-    try:
-        # Let's set a random seed for repeatable results
-        np.random.seed(42)
-
-        # Store the debug level
-        debugLevel = settings.DebugLevel
-
-        # Define measurement points using the settings specified in the config file
-        # These are the center points of the subsets
-        subSetSize = settings.SubsetSize
-        stepSize = settings.StepSize
-        shapeFn = settings.ShapeFunctions
-        subSetPnts = initSubSetPnts # Change from planarDICLocal
-
-        # Deal with a binary mask if specified
-        roiMask = None
-        activeSubsets = np.ones(subSetPnts.shape[:2], dtype=bool)
-
-        if settings.hasMask():
-            img0 = sdic.readImage(imgSet[0])
-            roiMask = sdic._loadMask_(settings.MaskFile, img0.shape)
-            activeSubsets = sdic._buildActiveSubsetsMask_(subSetPnts, roiMask)
-
-            if debugLevel > 0:
-                nActive = np.count_nonzero(activeSubsets)
-                nTotal = activeSubsets.size
-                print('\nMask Information :')
-                print('---------------------------------')
-                print(f'  Active subsets   : {nActive}')
-                print(f'  Inactive subsets : {nTotal - nActive}')
-
-        if not np.any(activeSubsets):
-            raise ValueError("The specified mask excludes all subset centers. No active subsets remain.")
-
-        # Get the image pair information
-        imgDatum = settings.DatumImage
-        imgTarget = settings.TargetImage
-        if imgTarget == -1:
-            imgTarget = len(imgSet)-1
-        imgIncr = settings.Increment
-        imgPairs = int((imgTarget - imgDatum)/imgIncr)
-
-        # Debug output if requested
-        if debugLevel > 0:
-            print('\nImage Pair Information :')
-            print('---------------------------------')
-            print('  Number of image pairs : {}'.format(imgPairs))
-
-        # Setup serialization of the data to msgpack binary file
-        df = dataFile.DataFile.openWriter(resultsFile)
-        df.writeHeading(settings)
-
-        # Initialize the parallel enviroment if required
-        nCpus = settings.CPUCount
-        if nCpus > 1:
-            if debugLevel > 0:
-                print('\nParallel Run Information :')
-                print('---------------------------------')
-                print('  Starting parallel run with {} CPUs'.format(nCpus))
-                if externalRay:
-                    print('  Using external ray server')
-
-                # Init ray with restarts
-                sdic._safeRayInit_(externalRay, nCpus, debugLevel=debugLevel)
-
-        # Loop through all image pairs to perform the local DIC
-        returnData = []
-        x_coordInit = np.copy(subSetPnts[:, :, CompID.XCoordID])
-        y_coordInit = np.copy(subSetPnts[:, :, CompID.YCoordID])
-
-        for imgPairIdx, img in enumerate(range(imgDatum, imgTarget, imgIncr)):
-
-            # Store previous iteration displacement values
-            x_dispPrev = np.copy(subSetPnts[:, :, CompID.XDispID])
-            y_dispPrev = np.copy(subSetPnts[:, :, CompID.YDispID])
-
-            # Setup the parallel run and wait for all results
-            if nCpus > 1:
-
-                ray = sdic._require_ray()
-                _rmt_icOptimization_ = sdic._get_rmt_icOptimization()
-
-                # Turn of debugging temporarily
-                nDebugOld = settings.DebugLevel
-                settings.DebugLevel = 0
-
-                # Setup the submatrices - match shape to image if possible
-                nTotRows, nTotCols, _ = subSetPnts.shape
-                mRows, mCols = _factorCPUCount_(nCpus, nTotRows/nTotCols)
-                if nDebugOld > 0:
-                    print("\n  Splitting matrix into {}x{} submatrices".format(
-                        mRows, mCols))
-                    print("")
-                subMatrices = _splitMatrix_(subSetPnts, mRows, mCols)
-                activeSubMatrices = _splitMatrix_(activeSubsets, mRows, mCols)
-
-                # Track the processes that are being submitted
-                procIDs = []
-                for i in range(mRows*mCols):
-                    iRow, iCol = np.unravel_index(i, (mRows, mCols))
-                    procIDs.append(_rmt_icOptimization_.remote(
-                        settings, iRow, iCol, subMatrices[iRow][iCol],
-                        activeSubMatrices[iRow][iCol], imgSet, img, guiThread=guiThread))
-
-                    if nDebugOld > 0:
-                        print("  Starting remote process for submatrix {} {}".
-                              format(iRow, iCol))
-
-                if nDebugOld > 0:
-                    print("")
-
-                # Wait for results - start pulling results from tasks as soon as they are
-                # are done
-                while len(procIDs):
-                    done_id, procIDs = ray.wait(procIDs)
-
-                    # Launch ray tasks with retries
-                    iRow, iCol, rsltMatrix = sdic._safeRayLaunch_(
-                        done_id[0], debugLevel=nDebugOld)
-                    (subMatrices[iRow][iCol])[:] = rsltMatrix
-                    if nDebugOld > 0:
-                        print("  Submatrix {} {} completed".format(iRow, iCol))
-
-                # Turn debugging back on
-                settings.DebugLevel = nDebugOld
-
-            # Serial run on one processor
-            else:
-                # coefficients at convergence for current (i'th) image pair
-                subSetPnts[:] = sdic._icOptimization_(
-                    settings, subSetPnts, activeSubsets, imgSet, img, guiThread=guiThread)
-
-            # Update the subset points coordinates if required - we make copies of the
-            # current subset points to create a new array of subset points
-            if settings.isRelativeStrategy():
-                subSetPnts[:] = sdic._updateSubSets_(x_coordInit, y_coordInit, x_dispPrev, y_dispPrev,
-                                                subSetPnts)
-
-            # Store the current subset points in the return data
-            subSetPntsOut = np.copy(subSetPnts)
-            subSetPntsOut[:, :, CompID.XCoordID] = x_coordInit
-            subSetPntsOut[:, :, CompID.YCoordID] = y_coordInit
-            subSetPntsOut = _applyInactiveSubsets_(subSetPntsOut, activeSubsets)
-            returnData.append(subSetPntsOut)
-            df.writeSubSetData(imgPairIdx, subSetPntsOut)
-
-            # Make some debug output
-            if (settings.DebugLevel > 0):
-                print('\n  ------------------------------------------------------')
-                print('  Image pair {} processed:'.format(imgPairIdx))
-                if settings.isAbsoluteStrategy():
-                    print('    '+imgSet[imgDatum])
-                else:
-                    print('    '+imgSet[img])
-                print('    '+imgSet[img+imgIncr])
-                print('  ------------------------------------------------------\n')
-
-        # Shutdown the parallel environment if required
-        if settings.CPUCount > 1:
-            sdic._safeRayShutdown_(externalRay, debugLevel=debugLevel)
-
-        # Close the file
-        df.close()
-
-        return returnData
-
-    # Handle exceptions and shutdown ray if required
-    except Exception as e:
-        if settings.CPUCount > 1:
-            sdic._safeRayShutdown_(externalRay, debugLevel=debugLevel)
-        raise e
 
 # TODO: Add option to set calibration parameters location in settings file. The
 # parameters should be stored in a csv file in the required format.
@@ -605,17 +617,17 @@ def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
     #    leftSubSetPnts and matching rightSubSetPnts
     refLeftImg = leftImgSet[settings.DatumImage]
     refRightImg = rightImgSet[settings.DatumImage]
-    leftSubSetPnts_init, rightSubSetPnts_init = stereoMatch(settings, refLeftImg, refRightImg, fillMissing)
+    leftSubSetPnts_init, rightSubSetPnts_init = stereoMatch(settings, calData, refLeftImg, refRightImg, fillMissing)
 
     # 4. Perform temporal matching on the left image set
     if settings.DebugLevel > 0:
         print("Performing temporal matching on the left image set...")
-    results_left = temporalMatch(leftSubSetPnts_init, leftImgSet, settings, "tm_results_left.sdic")
+    results_left = sdic._temporalMatch_(leftSubSetPnts_init, leftImgSet, settings, "tm_results_left.sdic")
 
     # 5. Perform temporal matching on the right image set
     if settings.DebugLevel > 0:
         print("Performing temporal matching on the right image set...")
-    results_right = temporalMatch(rightSubSetPnts_init, rightImgSet, settings, "tm_results_right.sdic")
+    results_right = sdic._temporalMatch_(rightSubSetPnts_init, rightImgSet, settings, "tm_results_right.sdic")
 
     # 6. Perform coordinate system transform to transform the displacements from
     #    the left image plane and right image plane (2D) to the world
@@ -625,9 +637,9 @@ def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
     imgDatum = settings.DatumImage
     imgTarget = settings.TargetImage
     if imgTarget == -1:
-        imgTarget = len(leftImgSet)-1
+        imgTarget = len(leftImgSet) - 1
     imgIncr = settings.Increment
-    imgPairs = int((imgTarget - imgDatum)/imgIncr)
+    imgPairs = int((imgTarget - imgDatum) / imgIncr)
 
     # Prepare results file writer for stereo results
     df = dataFile.DataFile.openWriter(resultsFile)
@@ -698,6 +710,124 @@ def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
 
     return returnData
 
+
+def plotSubSetsOnImage(img, subSetPnts, applyDeformation=True, showCenters=True, maxSubSets=None, fileName="subsets.png", showPlot=True):
+    """
+    Plots the subsets on the provided image with their correct (deformed) shapes.
+
+    Parameters:
+        - img: Image file path (str) or loaded image array (ndarray).
+        - subSetPnts (ndarray): The subset points array.
+        - applyDeformation (bool): Whether to plot subsets with their deformed shapes.
+        - showCenters (bool): Whether to plot a marker at the center of each subset.
+        - maxSubSets (int, optional): Maximum number of subsets to plot to avoid clutter.
+        - fileName (str): Path to save the plot image.
+        - showPlot (bool): Whether to display the plot interactively.
+    """
+    # Read the image if a file path is provided
+    if isinstance(img, str):
+        image = cv.imread(img, cv.IMREAD_GRAYSCALE)
+        if image is None:
+            raise FileNotFoundError(f"Could not read image from '{img}'")
+    else:
+        image = img
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.imshow(image, cmap='gray')
+
+    # Flatten the 3D subset points array to a 2D array for easier iteration
+    flat_subsets = subSetPnts.reshape(-1, subSetPnts.shape[-1])
+
+    # Filter for active and valid subsets
+    valid_mask = ~np.isnan(flat_subsets[:, CompID.XCoordID]) & \
+        ~np.isnan(flat_subsets[:, CompID.YCoordID])
+
+    valid_subsets = flat_subsets[valid_mask]
+
+    # Subsample if maxSubSets is specified and exceeded
+    if maxSubSets is not None and maxSubSets > 0 and len(valid_subsets) > maxSubSets:
+        indices = np.linspace(0, len(valid_subsets) - 1, maxSubSets, dtype=int)
+        valid_subsets = valid_subsets[indices]
+
+    for subset in valid_subsets:
+        x0 = subset[CompID.XCoordID]
+        y0 = subset[CompID.YCoordID]
+        ss = subset[CompID.SSSizeID]
+        shape_fn = int(subset[CompID.ShapeFnID])
+
+        hw = (ss - 1) / 2.0
+
+        # Create points along the perimeter of the undeformed square
+        # Using multiple points per edge ensures smooth boundaries for quadratic deformation
+        edge_points = 10
+
+        # Top edge
+        xsi_top = np.linspace(-hw, hw, edge_points)
+        eta_top = np.full_like(xsi_top, -hw)
+        # Right edge
+        eta_right = np.linspace(-hw, hw, edge_points)
+        xsi_right = np.full_like(eta_right, hw)
+        # Bottom edge
+        xsi_bottom = np.linspace(hw, -hw, edge_points)
+        eta_bottom = np.full_like(xsi_bottom, hw)
+        # Left edge
+        eta_left = np.linspace(hw, -hw, edge_points)
+        xsi_left = np.full_like(eta_left, -hw)
+
+        xsi = np.concatenate([xsi_top, xsi_right, xsi_bottom, xsi_left])
+        eta = np.concatenate([eta_top, eta_right, eta_bottom, eta_left])
+
+        if applyDeformation:
+            # Model coefficients span from XDispID to XDispID + 12
+            p = subset[CompID.XDispID : CompID.XDispID + 12]
+        else:
+            p = np.zeros(12)
+
+        # Apply displacement mapping
+        if shape_fn == ShapeFN.AFFINE:
+            xsi_d = (1 + p[1]) * xsi + p[2] * eta + p[0]
+            eta_d = p[7] * xsi + (1 + p[8]) * eta + p[6]
+        elif shape_fn == ShapeFN.QUADRATIC:
+            xsi_d = 0.5 * p[3] * (xsi**2) + p[4] * (xsi * eta) + 0.5 * p[5] * (eta**2) + \
+                (1 + p[1]) * xsi + p[2] * eta + p[0]
+            eta_d = 0.5 * p[9] * (xsi**2) + p[10] * (xsi * eta) + 0.5 * p[11] * (eta**2) + \
+                p[7] * xsi + (1 + p[8]) * eta + p[6]
+        else:
+            xsi_d = xsi
+            eta_d = eta
+
+        # Compute absolute deformed coordinates
+        x_d = x0 + xsi_d
+        y_d = y0 + eta_d
+
+        # Plot polygon outline
+        poly_points = np.column_stack((x_d, y_d))
+        polygon = Polygon(poly_points, closed=True, edgecolor='red', facecolor='none', linewidth=1.5, alpha=0.8)
+        ax.add_patch(polygon)
+
+        # Plot deformed center point
+        if showCenters:
+            cx = x0 + p[0]
+            cy = y0 + p[6]
+            ax.plot(cx, cy, marker='+', color='blue', markersize=5)
+
+    ax.set_title("DIC Subsets on Image")
+    ax.set_xlabel("X (pixels)")
+    ax.set_ylabel("Y (pixels)")
+    ax.set_aspect('equal')
+
+    plt.tight_layout()
+
+    if fileName:
+        plt.savefig(fileName, dpi=300)
+        print(f"Plot saved to '{fileName}'")
+
+    if showPlot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def plotStereoSubSets2D(leftSubSetPnts, rightSubSetPnts, fileName="subset_points_2d.png", showPlot=False):
     """
     Plot both the leftSubSetPnts and rightSubSetPnts on a 2D scatter plot.
@@ -737,6 +867,7 @@ def plotStereoSubSets2D(leftSubSetPnts, rightSubSetPnts, fileName="subset_points
         plt.show(fig)
     else:
         plt.close(fig)
+
 
 def plotSubSets3D(worldSubSetPnts, fileName="subset_points_3d.png", showPlot=False, set_aspect="auto"):
     """
@@ -791,6 +922,7 @@ def plotSubSets3D(worldSubSetPnts, fileName="subset_points_3d.png", showPlot=Fal
         plt.show(fig)
     else:
         plt.close(fig)
+
 
 def plotDispContour3D(worldSubSetPnts,
                       dispComp="z",
@@ -850,8 +982,8 @@ def plotDispContour3D(worldSubSetPnts,
     ax = fig.add_subplot(111, projection='3d')
 
     # Use displacement as color
-    sc = ax.scatter(x, y, z, c=disp, cmap='viridis', s=8, alpha=0.9)
-    cbar = plt.colorbar(sc, ax=ax, pad=0.1, shrink=0.7)
+    scatter = ax.scatter(x, y, z, c=disp, cmap='viridis', s=8, alpha=0.9)
+    cbar = plt.colorbar(scatter, ax=ax, pad=0.1, shrink=0.7)
     cbar.set_label(colorbar_label)
 
     # Labels and title
@@ -872,3 +1004,78 @@ def plotDispContour3D(worldSubSetPnts,
         plt.show()
     else:
         plt.close()
+
+
+def plotPoints3D(points_3d, fileName="points_3d.png", showPlot=False, set_aspect="auto"):
+    """
+    Plot 3D triangulated keypoints on a scatter plot.
+
+    Left camera focal point is used as the origin (0, 0, 0) in world coordinates.
+
+    Parameters:
+        - points_3d (ndarray): Array of 3D points. Expected shape (N, 3).
+        - fileName (str): Path where the plot image will be saved.
+        - showPlot (bool): Whether to display the interactive plot window. Defaults to False.
+        - set_aspect (str): Set plot axis scaling ('auto', 'equal', etc.). Defaults to 'auto'.
+    """
+    if points_3d is None or len(points_3d) == 0:
+        print("No valid 3D points to plot.")
+        return
+
+    # Ensure shape is (N, 3)
+    pts = np.asarray(points_3d, dtype=np.float32).reshape(-1, 3)
+
+    # Filter out invalid points (NaN or Inf)
+    valid_mask = np.isfinite(pts).all(axis=1)
+    pts = pts[valid_mask]
+
+    if pts.size == 0:
+        print("No valid 3D points remaining after NaN/Inf filtering.")
+        return
+
+    # Create 3D Plot
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Scatter points colored by Z depth
+    scatter = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=pts[:, 2], cmap='viridis', s=10, alpha=0.8)
+    fig.colorbar(scatter, ax=ax, label='Z Depth (mm)', shrink=0.6)
+
+    # Axis labels and title
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+    ax.set_zlabel("Z (mm)")
+    ax.set_title(f"Triangulated Keypoints in 3D (N={len(pts)})")
+    ax.grid(True)
+
+    # Handle aspect ratio scaling
+    if set_aspect == 'equal':
+        max_range = np.array([
+            pts[:, 0].max() - pts[:, 0].min(),
+            pts[:, 1].max() - pts[:, 1].min(),
+            pts[:, 2].max() - pts[:, 2].min()
+        ]).max() / 2.0
+
+        mid_x = (pts[:, 0].max() + pts[:, 0].min()) * 0.5
+        mid_y = (pts[:, 1].max() + pts[:, 1].min()) * 0.5
+        mid_z = (pts[:, 2].max() + pts[:, 2].min()) * 0.5
+
+        ax.set_xlim(mid_x - max_range, mid_x + max_range)
+        ax.set_ylim(mid_y - max_range, mid_y + max_range)
+        ax.set_zlim(mid_z - max_range, mid_z + max_range)
+    else:
+        try:
+            ax.set_aspect(set_aspect)
+        except Exception:
+            ax.set_aspect('auto')
+
+    plt.tight_layout()
+
+    # Save or Display
+    plt.savefig(fileName, dpi=300)
+    print(f"Plot saved to '{fileName}'")
+
+    if showPlot:
+        plt.show()
+    else:
+        plt.close(fig)

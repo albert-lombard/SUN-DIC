@@ -45,7 +45,7 @@ from datetime import datetime
 
 # Import external libraries
 import cv2 as cv
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 import numpy as np
 # from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial.transform import Rotation
@@ -53,6 +53,7 @@ from scipy.spatial.transform import Rotation
 # ====================
 #      Functions
 # ====================
+
 
 # The problem with the following function is that it sets the reference
 # orientation of the grid to that of the first image, even if the first image
@@ -97,6 +98,8 @@ def _isOrientationConsistent_(corners1, corners2, referenceDirection):
 
     return True
 
+
+# --------------------------------------------------------------------------------
 def _detectCheckerboardCorners_(imgFile1, imgFile2, boardSize, debugLevel=1):
     """
     Detect checkerboard corners in a stereo image pair and refine their coordinates.
@@ -147,6 +150,8 @@ def _detectCheckerboardCorners_(imgFile1, imgFile2, boardSize, debugLevel=1):
 
     return (corners_subpix1, corners_subpix2, imgFile1, imgFile2)
 
+
+# --------------------------------------------------------------------------------
 def calibrateCheckerboard(boardSize, squareSize, leftImages, rightImages, fileName="chb_caldata.pkl", debugLevel=0):
     """
     Perform stereo camera calibration using a set of checkerboard image pairs.
@@ -286,6 +291,8 @@ def calibrateCheckerboard(boardSize, squareSize, leftImages, rightImages, fileNa
 
     return calData
 
+
+# --------------------------------------------------------------------------------
 def _getParameters_(calData):
     """
     Extract and format stereo calibration data into a flat parameter dictionary.
@@ -375,6 +382,8 @@ def _getParameters_(calData):
 
     return parameters
 
+
+# --------------------------------------------------------------------------------
 def printParameters(calData):
     """
     Print calibration parameters extracted from calData in a readable format.
@@ -400,6 +409,7 @@ def printParameters(calData):
     print(retStr)
 
 
+# --------------------------------------------------------------------------------
 def saveParametersCSV(calData, fileName="calibration_parameters.csv", debugLevel=1):
     """
     Save stereo calibration parameters to a CSV file.
@@ -432,6 +442,8 @@ def saveParametersCSV(calData, fileName="calibration_parameters.csv", debugLevel
     if debugLevel > 0:
         print(f"\nCalibration parameters saved to {fileName}")
 
+
+# --------------------------------------------------------------------------------
 def _readParametersCSV_(fileName="calibration_parameters.csv", debugLevel=1):
     """
     Read stereo calibration parameters from a CSV file.
@@ -451,7 +463,7 @@ def _readParametersCSV_(fileName="calibration_parameters.csv", debugLevel=1):
     try:
         with open(fileName, mode='r') as file:
             reader = csv.reader(file)
-            header = next(reader)  # Skip header row
+            next(reader)  # Skip header row
 
             for row in reader:
                 if len(row) != 2:
@@ -478,16 +490,19 @@ def _readParametersCSV_(fileName="calibration_parameters.csv", debugLevel=1):
             print(f"Error: File '{fileName}' not found.")
         return None
 
+
+# --------------------------------------------------------------------------------
 def _getDataFromParameters_(parameters):
     """
-    Reconstruct the original calibration data dictionary from flattened parameters.
+    Reconstruct the original calibration data dictionary from flattened parameters,
+    and calculate the Essential and Fundamental matrices.
 
     Parameters:
         - parameters (dict): Flattened calibration parameter dictionary.
 
     Returns:
         - calData (dict): Reconstructed `calData` dictionary with keys:
-            - 'img_size', 'proj_error', 'K1', 'D1', 'K2', 'D2', 'T', 'R'
+            - 'img_size', 'proj_error', 'K1', 'D1', 'K2', 'D2', 'T', 'R', 'E', 'F'
     """
     # Intrinsic matrices
     K1 = np.array([
@@ -528,6 +543,22 @@ def _getDataFromParameters_(parameters):
     rotation = Rotation.from_euler('xyz', [parameters["Rx"], parameters["Ry"], parameters["Rz"]], degrees=True)
     R = rotation.as_matrix()
 
+    # Create the skew-symmetric matrix of T for the cross product
+    tx, ty, tz = T.flatten()
+    T_skew = np.array([
+        [0, -tz, ty],
+        [tz, 0, -tx],
+        [-ty, tx, 0]
+    ])
+
+    # Essential Matrix: E = [T]_x * R
+    E = T_skew @ R
+
+    # Fundamental Matrix: F = (K2^-T) * E * (K1^-1)
+    K1_inv = np.linalg.inv(K1)
+    K2_inv = np.linalg.inv(K2)
+    F = K2_inv.T @ E @ K1_inv
+
     # Image size
     img_size = (parameters["img_width"], parameters["img_height"])
 
@@ -540,11 +571,15 @@ def _getDataFromParameters_(parameters):
         "K2": K2,
         "D2": D2,
         "T": T,
-        "R": R
+        "R": R,
+        "E": E,
+        "F": F
     }
 
     return calData
 
+
+# --------------------------------------------------------------------------------
 def getDataFromParametersCSV(fileName="calibration_parameters.csv"):
     """
     Load stereo calibration data from a CSV file.
@@ -564,6 +599,8 @@ def getDataFromParametersCSV(fileName="calibration_parameters.csv"):
     calData = _getDataFromParameters_(_readParametersCSV_(fileName))
     return calData
 
+
+# --------------------------------------------------------------------------------
 def loadData(fileName):
     """
     Load stereo calibration data from a pickle (.pkl) file.
