@@ -334,7 +334,7 @@ def calibrateCheckerboard(boardSize, squareSize, leftImages, rightImages, fileNa
         "proj_error": err,
         "K1": K1, "D1": D1,           # Left camera intrinsics
         "K2": K2, "D2": D2,           # Right camera intrinsics
-        "R": R, "T": T,               # Rotation and translation between cameras
+        "T": T, "R": R,               # Rotation and translation between cameras
         "E": E, "F": F                # Essential and Fundamental matrices
     }
 
@@ -552,6 +552,26 @@ def _readParametersCSV_(fileName="calibration_parameters.csv", debugLevel=1):
 
 
 # --------------------------------------------------------------------------------
+def _calculateInverseK_(K):
+    """
+    Analytically calculates the inverse of a upper triangular K matrix.
+
+    """
+    fx, s, cx = K[0, 0], K[0, 1], K[0, 2]
+    fy, cy = K[1, 1], K[1, 2]
+
+    K_inv = np.zeros((3, 3), dtype=K.dtype)
+    K_inv[0, 0] = 1.0 / fx
+    K_inv[0, 1] = -s / (fx * fy)
+    K_inv[0, 2] = (s * cy - fy * cx) / (fx * fy)
+    K_inv[1, 1] = 1.0 / fy
+    K_inv[1, 2] = -cy / fy
+    K_inv[2, 2] = 1.0
+
+    return K_inv
+
+
+# --------------------------------------------------------------------------------
 def _getDataFromParameters_(parameters):
     """
     Reconstruct the original calibration data dictionary from flattened parameters,
@@ -615,9 +635,25 @@ def _getDataFromParameters_(parameters):
     E = T_skew @ R
 
     # Fundamental Matrix: F = (K2^-T) * E * (K1^-1)
-    K1_inv = np.linalg.inv(K1)
-    K2_inv = np.linalg.inv(K2)
-    F = K2_inv.T @ E @ K1_inv
+    # 1. Algebraic calculation
+    K1_inv = _calculateInverseK_(K1)
+    K2_inv = _calculateInverseK_(K2)
+    F_raw = K2_inv.T @ E @ K1_inv
+
+    # 2. SVD Decomposition
+    U, S, Vt = np.linalg.svd(F_raw)
+
+    # 3. Enforce rank-2 constraint (zero out the smallest singular value)
+
+    S[2] = 0
+    Sigma = np.diag(S)
+
+    # 4. Reconstruct stable F
+    F = U @ Sigma @ Vt
+
+    # Normalise F to match OpenCV convention (F[2,2] = 1)
+    if abs(F[2, 2]) > 1e-10:    # Check for numerical instability
+        F = F / F[2, 2]
 
     # Image size
     img_size = (parameters["img_width"], parameters["img_height"])
