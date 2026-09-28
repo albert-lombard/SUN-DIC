@@ -55,6 +55,57 @@ from scipy.spatial.transform import Rotation
 # ====================
 
 
+def _correct_board_orientation_(corners, pattern_size):
+    """
+    Reshapes OpenCV corners into a 2D grid and rotates/transposes the matrix
+    so that the points always read left-to-right, top-to-bottom.
+    """
+    cols, rows = pattern_size
+
+    # 1. Reshape the 1D array of corners into a 2D grid representing the board
+    # OpenCV shape is (N, 1, 2) -> we make it (rows, cols, 2)
+    grid = corners.reshape(rows, cols, 2)
+
+    # 2. Check the 4 physical extremities of the grid
+    extremities = [
+        (0, 0),                 # Current Top-Left
+        (0, cols - 1),          # Current Top-Right
+        (rows - 1, cols - 1),   # Current Bottom-Right
+        (rows - 1, 0)           # Current Bottom-Left
+    ]
+
+    # Find the extremity closest to the image top-left (minimizing x + y)
+    top_left_idx = min(extremities, key=lambda idx: grid[idx][0] + grid[idx][1])
+
+    # 3. Rotate the matrix so the true top-left point becomes index [0, 0]
+    if top_left_idx == (rows - 1, cols - 1):
+        # Board is upside down (180 degrees)
+        grid = np.flip(grid, axis=(0, 1))
+
+    elif top_left_idx == (0, cols - 1):
+        # Board is rotated 90 degrees in one direction
+        grid = np.rot90(grid, k=1, axes=(0, 1))
+
+    elif top_left_idx == (rows - 1, 0):
+        # Board is rotated 90 degrees in the other direction
+        grid = np.rot90(grid, k=-1, axes=(0, 1))
+
+    # 4. Ensure the axes are correct (columns go right, rows go down)
+    # Even with the top-left point fixed, the matrix might be transposed
+    # (i.e., reading top-to-bottom first instead of left-to-right).
+    if grid.shape[0] > 1 and grid.shape[1] > 1:
+        step_col = grid[0, 1] - grid[0, 0]  # Vector pointing to the next column
+        step_row = grid[1, 0] - grid[0, 0]  # Vector pointing to the next row
+
+        # If moving to the next row causes a larger X (horizontal) shift than
+        # moving to the next column, the axes are swapped.
+        if abs(step_row[0]) > abs(step_col[0]):
+            grid = np.transpose(grid, axes=(1, 0, 2))
+
+    # Flatten back to OpenCV's expected (N, 1, 2) shape
+    return grid.reshape(-1, 1, 2)
+
+
 # The problem with the following function is that it sets the reference
 # orientation of the grid to that of the first image, even if the first image
 # has an orientation that differs with the rest of the images. Works ok for now.
@@ -81,7 +132,7 @@ def _isOrientationConsistent_(corners1, corners2, referenceDirection):
 
     # Set reference direction if not already set
     if referenceDirection[0] is None:
-        referenceDirection[0] = (direction1 + direction2) / 2 # Average
+        referenceDirection[0] = (direction1 + direction2) / 2  # Average
         referenceDirection[0] /= np.linalg.norm(referenceDirection[0])  # Normalize
         # print("Set reference orientation.")
         return True
@@ -145,6 +196,10 @@ def _detectCheckerboardCorners_(imgFile1, imgFile2, boardSize, debugLevel=1):
     corners_subpix1 = cv.cornerSubPix(gray1, corners1, (11, 11), (-1, -1), criteria)
     corners_subpix2 = cv.cornerSubPix(gray2, corners2, (11, 11), (-1, -1), criteria)
 
+    # Ensure first corner is closest to the top left of the image
+    corners_subpix1 = _correct_board_orientation_(corners_subpix1, boardSize)
+    corners_subpix2 = _correct_board_orientation_(corners_subpix2, boardSize)
+
     if debugLevel >= 1:
         print(f"Corners detected: {os.path.basename(imgFile1)} | {os.path.basename(imgFile2)}")
 
@@ -152,7 +207,8 @@ def _detectCheckerboardCorners_(imgFile1, imgFile2, boardSize, debugLevel=1):
 
 
 # --------------------------------------------------------------------------------
-def calibrateCheckerboard(boardSize, squareSize, leftImages, rightImages, fileName="chb_caldata.pkl", debugLevel=0):
+# TODO: Show more info, such as N/Total images with corners found etc.
+def calibrateCheckerboard(boardSize, squareSize, leftImages, rightImages, fileName="chb_caldata.pkl", max_workers=os.cpu_count()//2,debugLevel=0):
     """
     Perform stereo camera calibration using a set of checkerboard image pairs.
 
@@ -191,7 +247,7 @@ def calibrateCheckerboard(boardSize, squareSize, leftImages, rightImages, fileNa
     imgPoints2 = []   # 2D points in right image
 
     # Detect checkerboard corners in all image pairs using multithreading
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         all_results = list(executor.map(
             lambda pair: _detectCheckerboardCorners_(pair[0], pair[1], boardSize, debugLevel),
             zip(leftImages, rightImages)
@@ -239,6 +295,10 @@ def calibrateCheckerboard(boardSize, squareSize, leftImages, rightImages, fileNa
     # If no valid corner pairs were found, raise an error
     if not objPoints:
         raise RuntimeError("No valid corners found in the image set.")
+
+    # Print the number of valid image pairs
+    if debugLevel >= 1:
+        print(f"Found {len(objPoints)}/{len(leftImages)} valid sets of corner pairs.")
 
     if debugLevel >= 1:
         print("\nCalibrating individual cameras...")
