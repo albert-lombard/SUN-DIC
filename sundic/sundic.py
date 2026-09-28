@@ -1330,7 +1330,7 @@ def _getStartingPnt_(subSetPnts, activeSubsets, nGQPoints, F, G, GInter, nBGCutO
     keypoints in a selection of subset points located at Gauss Quadrature points spread
     over the image.  The keypoints are matched and used to estimate the
     deformation from the reference to the deformed image to calcluate the CZNSSD parameter
-    for each.  The point the smallest CZNSSD is selected as the starting point.  This
+    for each.  The point with the smallest CZNSSD is selected as the starting point.  This
     should provide a good starting point for the optimization algorithm for these points.
 
     Parameters:
