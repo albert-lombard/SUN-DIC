@@ -834,8 +834,18 @@ def _icOptimization_(settings, subSetPnts, activeSubsets, imgSet, img, guiThread
         nBGCutOff = nBGCutOff/FMax
 
     # Get the starting point for the optimization
-    nextPnt, subSetPnts = _getStartingPnt_(
-        subSetPnts, activeSubsets, nGPPoints, F, G, GInter, nBGCutOff, _relativeCoords_cache)
+    if nGPPoints > 0:
+        nextPnt, subSetPnts = _getStartingPnt_(
+            subSetPnts, activeSubsets, nGPPoints, F, G, GInter, nBGCutOff, _relativeCoords_cache)
+    else:
+        # If number of starting points is set to 0, choose the first active subset
+        iRow, iCol = None, None
+        nCols = activeSubsets.shape[1]
+        for index, active in enumerate(activeSubsets.flat):
+            if active:
+                iRow, iCol = divmod(index, nCols)
+                break
+        nextPnt = iRow, iCol
 
     # Boolean array to indicate which points have been analyzed - initially all are false
     analyze = np.zeros_like(subSetPnts[:, :, CompID.XCoordID], dtype=bool)
