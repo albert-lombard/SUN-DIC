@@ -1,36 +1,31 @@
 import copy
-import glob
 import os
 import shutil
 from enum import IntEnum
 
 import cv2 as cv
+import skimage as sk
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 import natsort as ns
 import numpy as np
 import sundic.sundic as sdic
+import sundic.post_process as sdpp
+import sundic.util.datafile as dataFile
 from sundic.sundic import CompID, IntConst, ShapeFN
 from scipy.interpolate import griddata
-import sundic.post_process as sdpp
-import sundic.stereo_calibrate as sc
-# from skimage.exposure import match_histograms
-import ray
-from concurrent.futures import ThreadPoolExecutor
+from scipy.spatial import KDTree
 
-import sundic.util.datafile as dataFile
 
-# Modify the subset array indices to include z-coordinates and diplacements
-class CompID(IntEnum):
+# Define integer constants for accessing the subset stereo data array
+class StereoCompID(IntEnum):
     XCoordID = 0   # The x-coordinate of the subset center point
     YCoordID = 1   # The y-coordinate of the subset center point
-    SSSizeID = 2   # The subset size
-    ShapeFnID = 3   # The shape function - 0 = affine, 1 = quadratic
-    CZNSSDID = 4   # The CZNSSD value for the subset
-    XDispID = 5   # The x-displacement of the subset point - start of x model coefficients
-    YDispID = 11  # The y-displacement of the subset point - start of y model coefficients
-    ZCoordID = 17   # The z-coordinate of the subset center point
-    ZDispID = 18   # The z-displacement of the subset point - start of z model coefficients
+    ZCoordID = 2   # The z-coordinate of the subset center point
+    XDispID = 3   # The x-displacement of the subset point
+    YDispID = 4   # The y-displacement of the subset point
+    ZDispID = 5   # The z-displacement of the subset point
+    ProjErrID = 6   # The reprojection error of the subset point
 
 
 # TODO: Check if there are any images
@@ -88,14 +83,12 @@ def getStereoImageList(folderPath, debugLevel=0):
         # Left image files end with _0
         left_files = ns.natsorted([
             file for file in os.listdir(root_path)
-            if os.path.splitext(file)[1].lower() in supported_file_types
-            and os.path.splitext(file)[0].endswith('_0')
+            if os.path.splitext(file)[1].lower() in supported_file_types and os.path.splitext(file)[0].endswith('_0')
         ])
         # Right image files end with _1
         right_files = ns.natsorted([
             file for file in os.listdir(root_path)
-            if os.path.splitext(file)[1].lower() in supported_file_types
-            and os.path.splitext(file)[0].endswith('_1')
+            if os.path.splitext(file)[1].lower() in supported_file_types and os.path.splitext(file)[0].endswith('_1')
         ])
 
         # Store lists of full paths to left and right image sets
@@ -116,9 +109,8 @@ def getStereoImageList(folderPath, debugLevel=0):
 
     return leftImgSet, rightImgSet
 
-from scipy.spatial.transform import Rotation as Rscipy
 
-
+# TODO: Also return repropjection error
 def _triangulatePoints_(leftPts, rightPts, calData):
     """
     Triangulate a 3D points from corresponding set of 2D points.
@@ -150,24 +142,49 @@ def _triangulatePoints_(leftPts, rightPts, calData):
         rightPts = rightPts.reshape(-1, 1, 2)
 
     # Undistort the  points using the distortion coefficients
-    pts1 = cv.undistortPoints(leftPts, K1, D1, P=K1)
-    pts2 = cv.undistortPoints(rightPts, K2, D2, P=K2)
+    # pts1 = cv.undistortPoints(leftPts, K1, D1, P=K1)
+    # pts2 = cv.undistortPoints(rightPts, K2, D2, P=K2)
+    # Undistort into normalised image coordinates
+    pts1 = cv.undistortPoints(leftPts, K1, D1)
+    pts2 = cv.undistortPoints(rightPts, K2, D2)
 
     # Reshape to (2, N) for triangulation
     pts1 = pts1.reshape(-1, 2).T
     pts2 = pts2.reshape(-1, 2).T
 
     # Build projection matrices
-    P1 = K1 @ np.hstack((np.eye(3), np.zeros((3, 1))))     # K1 * [I | 0]
-    P2 = K2 @ np.hstack((R, T))                            # K2 * [R | T]
+    # P1 = K1 @ np.hstack((np.eye(3), np.zeros((3, 1))))     # K1 * [I | 0]
+    # P2 = K2 @ np.hstack((R, T))                            # K2 * [R | T]
+    P1 = np.hstack((np.eye(3), np.zeros((3, 1))))     # [I | 0]
+    P2 = np.hstack((R, T))                            # [R | T]
 
     # Triangulate homogeneous 3D points
     points_hom = cv.triangulatePoints(P1, P2, pts1, pts2)  # shape: (4, N)
 
-    # Convert from homogeneous coordinates to 3D
-    points_3d = cv.convertPointsFromHomogeneous(points_hom.T)
+    # Convert from homogeneous coordinates to 3D: (x, y, z, 1) -> (x, y, z)
+    points_3d = cv.convertPointsFromHomogeneous(points_hom.T).reshape(-1, 3)
 
-    return points_3d.squeeze()
+    # Reproject 3D points onto the left image
+    proj_left, _ = cv.projectPoints(points_3d, np.zeros(3), np.zeros(3), K1, D1)
+
+    # Reproject 3D points onto the right image
+    rvec, _ = cv.Rodrigues(R)
+    proj_right, _ = cv.projectPoints(points_3d, rvec, T, K2, D2)
+
+    # Reshape the points for calculating the reprojection error
+    proj_left = proj_left.reshape(-1, 2)
+    proj_right = proj_right.reshape(-1, 2)
+
+    leftPts = leftPts.reshape(-1, 2)
+    rightPts = rightPts.reshape(-1, 2)
+
+    err_left = np.linalg.norm(leftPts - proj_left, axis=1)
+    err_right = np.linalg.norm(rightPts - proj_right, axis=1)
+
+    # Calculate the reprojection error for each point
+    reproj_error = np.sqrt((err_left**2 + err_right**2) / 2)
+
+    return points_3d, reproj_error
 
 
 def _triangulateSubSets_(leftSubSetPnts, rightSubSetPnts, calData):
@@ -187,7 +204,7 @@ def _triangulateSubSets_(leftSubSetPnts, rightSubSetPnts, calData):
     Returns:
         - worldSubSetPnts (ndarray): Array of subset points in (3D) world coordinates.
     """
-    # 1. Extract 2D Points
+    # Extract 2D Points
     # Extract the (x, y) coordinates from the subset point arrays
     left_pts_2d = np.stack((
         leftSubSetPnts[:, :, CompID.XCoordID].flatten(),
@@ -199,32 +216,21 @@ def _triangulateSubSets_(leftSubSetPnts, rightSubSetPnts, calData):
         rightSubSetPnts[:, :, CompID.YCoordID].flatten()
     ), axis=1)
 
-    # 2. Triangulate to get 3D points
-    points_3d = _triangulatePoints_(left_pts_2d, right_pts_2d, calData)
+    # Triangulate to get 3D points
+    points_3d, reproj_error = _triangulatePoints_(left_pts_2d, right_pts_2d, calData)
 
-    # Check if triangulation returned valid points
-    # if points_3d is None or points_3d.ndim != 2 or points_3d.shape[1] != 3:
-    #     print("Warning: Triangulation did not return valid 3D points. Z-coordinates not updated.")
-    #     return leftSubSetPnts, rightSubSetPnts
-
-    # Create worldSubSetPnts with correct shape to store z-coordinates and displacements
-    subset_grid_shape = (leftSubSetPnts.shape[0], leftSubSetPnts.shape[1], int(CompID.ZDispID) + 1)
+    # Create worldSubSetPnts with correct shape to store 3D coordinates and displacements
+    subset_grid_shape = (leftSubSetPnts.shape[0], leftSubSetPnts.shape[1], len(StereoCompID))
     worldSubSetPnts = np.zeros(shape=subset_grid_shape)
 
     # Update the CoordID fields
-    data_shape = leftSubSetPnts[:, :, CompID.XCoordID].shape
-    worldSubSetPnts[:, :, CompID.XCoordID] = points_3d[:, 0].reshape(data_shape)
-    worldSubSetPnts[:, :, CompID.YCoordID] = points_3d[:, 1].reshape(data_shape)
-    worldSubSetPnts[:, :, CompID.ZCoordID] = points_3d[:, 2].reshape(data_shape)
+    data_shape = worldSubSetPnts[:, :, StereoCompID.XCoordID].shape
+    worldSubSetPnts[:, :, StereoCompID.XCoordID] = points_3d[:, 0].reshape(data_shape)
+    worldSubSetPnts[:, :, StereoCompID.YCoordID] = points_3d[:, 1].reshape(data_shape)
+    worldSubSetPnts[:, :, StereoCompID.ZCoordID] = points_3d[:, 2].reshape(data_shape)
 
-    # Reset correlation metric
-    worldSubSetPnts[:, :, CompID.CZNSSDID] = IntConst.CNZSSD_MAX
-
-    # Store the subset size
-    worldSubSetPnts[:, :, CompID.SSSizeID] = leftSubSetPnts[:, :, CompID.SSSizeID]
-
-    # Store the shape function type
-    worldSubSetPnts[:, :, CompID.ShapeFnID] = leftSubSetPnts[:, :, CompID.ShapeFnID]
+    # Update the ProjErrID fields
+    worldSubSetPnts[:, :, StereoCompID.ProjErrID] = reproj_error.reshape(data_shape)
 
     return worldSubSetPnts
 
@@ -240,7 +246,7 @@ def _fillMissingSubsets_(subSetPnts, method='cubic'):
     Returns:
         ndarray: subSetPnts with missing X and Y coordinates filled.
     """
-    for coord_id in [sdic.CompID.XCoordID, sdic.CompID.YCoordID]:
+    for coord_id in [CompID.XCoordID, CompID.YCoordID]:
         data = subSetPnts[:, :, coord_id]
         mask = ~np.isnan(data)
         if np.any(~mask):
@@ -252,42 +258,6 @@ def _fillMissingSubsets_(subSetPnts, method='cubic'):
             subSetPnts[:, :, coord_id] = data
     return subSetPnts
 
-
-def _resizeSubSetArray_(subset_array, required_size):
-    """
-    Resizes a subset point array to a required size if it's too small.
-
-    This helper function checks the size of the last dimension of the input array.
-    If it's smaller than the required size, it creates a new, larger array,
-    copies the old data into it, and returns the new array. Otherwise, it
-    returns the original array unchanged.
-
-    Parameters:
-        subset_array (ndarray): The input subset point array to check and resize.
-        required_size (int): The minimum required size for the last dimension.
-
-    Returns:
-        ndarray: The resized (or original) subset point array.
-    """
-    current_shape = subset_array.shape
-    # Check if the last dimension is smaller than what's required
-    if current_shape[2] < required_size:
-        # print(f"Resizing subset array from shape {current_shape} to a new size of "
-        #       f"({current_shape[0]}, {current_shape[1]}, {required_size}).")
-
-        # Define the shape for the new, larger array
-        new_shape = (current_shape[0], current_shape[1], required_size)
-
-        # Create a new array filled with zeros
-        resized_array = np.zeros(new_shape, dtype=subset_array.dtype)
-
-        # Copy the data from the smaller, original array into the new one
-        resized_array[:, :, :current_shape[2]] = subset_array
-
-        return resized_array
-
-    # If no resize is needed, return the original array
-    return subset_array
 
 def _getEpipolarMask_(Pnts1, Pnts2, calData, Threshold=2.0):
     """
@@ -302,75 +272,231 @@ def _getEpipolarMask_(Pnts1, Pnts2, calData, Threshold=2.0):
 
     """
     # Extract the Fundamental matrix
-    F = calData["F"]
+    # F = calData["F"]
+
+    # Extract the Essential matrix
+    E = calData["E"]
+
+    # Extract intrinsic and distortion parameters
+    K1, D1 = calData["K1"], calData["D1"]
+    K2, D2 = calData["K2"], calData["D2"]
+
+    # Reshape input points to (N, 1, 2)
+    Pnts1 = Pnts1.reshape(-1, 1, 2)
+    Pnts2 = Pnts2.reshape(-1, 1, 2)
+
+    # Undistort points into normalised image coordinates
+    Pnts1_norm = cv.undistortPoints(Pnts1, K1, D1)
+    Pnts2_norm = cv.undistortPoints(Pnts2, K2, D2)
+
+    # Reshape points back to (N, 2)
+    Pnts1_norm = Pnts1_norm.reshape(-1, 2)
+    Pnts2_norm = Pnts2_norm.reshape(-1, 2)
 
     # Compute the epipolar lines in image 1 for points in image 2
     # Computes ax + by + c = 0 for each point in Nx3 array
-    Lines1 = cv.computeCorrespondEpilines(Pnts2, 2, F)
+    # Lines1 = cv.computeCorrespondEpilines(Pnts2, 2, F)
+    Lines1 = cv.computeCorrespondEpilines(Pnts2_norm, 2, E)
     Lines1 = Lines1.reshape(-1, 3)
 
     # Calculate the distances from Pnts1 to Lines1
     # Distance formula: |ax + by + c | / sqrt(a^2 + b^2)
-    num1 = np.abs(Lines1[:,0] * Pnts1[:,0] + Lines1[:,1] * Pnts1[:,1] + Lines1[:,2])
+    num1 = np.abs(Lines1[:,0] * Pnts1_norm[:,0] + Lines1[:,1] * Pnts1_norm[:,1] + Lines1[:,2])
     den1 = np.sqrt(Lines1[:,0]**2 + Lines1[:,1]**2)
     dist1 = num1 / den1
 
     # Compute the epipolar lines in image 2 for points in image 1
     # Computes ax + by + c = 0 for each point in Nx3 array
-    Lines2 = cv.computeCorrespondEpilines(Pnts1, 1, F)
+    # Lines2 = cv.computeCorrespondEpilines(Pnts1, 1, F)
+    Lines2 = cv.computeCorrespondEpilines(Pnts1_norm, 1, E)
     Lines2 = Lines2.reshape(-1, 3)
 
     # Calculate the distances from Pnts2 to Lines2
     # Distance formula: |ax + by + c | / sqrt(a^2 + b^2)
-    num2 = np.abs(Lines2[:,0] * Pnts2[:,0] + Lines2[:,1] * Pnts2[:,1] + Lines2[:,2])
+    num2 = np.abs(Lines2[:,0] * Pnts2_norm[:,0] + Lines2[:,1] * Pnts2_norm[:,1] + Lines2[:,2])
     den2 = np.sqrt(Lines2[:,0]**2 + Lines2[:,1]**2)
     dist2 = num2 / den2
 
     # Use the maximum of the two as the error
     error = np.maximum(dist1, dist2)
 
+    # Average focal length of both cameras
+    f_avg = (K1[0,0] + K1[1,1] + K2[0,0] + K2[1,1]) / 4.0
+
+    # Calculate normalised threshold, as input threshold is in pixel coordinates
+    Threshold_norm = Threshold / f_avg
+
     # Create boolean mask based on threshold
-    mask = (error < Threshold).astype(np.uint8)
+    mask = (error < Threshold_norm).astype(np.uint8)
 
     return mask
 
-def filter_outliers_iqr(points_3d, factor=1.5):
+
+# TODO: doc string
+# TODO: Why is 8 selected as the minimum keypoints here?
+def _getStereoKeyPoints_(leftImg, rightImg, ROI):
+    # Read and normalize the images to be in the range 0-255
+    left_img_gray = sdic.readImage(leftImg, normalize8Bit=True)
+    right_img_gray = sdic.readImage(rightImg, normalize8Bit=True)
+
+    x_start, y_start, w, h = ROI
+    left_mask = np.zeros_like(left_img_gray, dtype=np.uint8)
+    left_mask[y_start:y_start+h, x_start:x_start+w] = 255
+
+    # TODO: Maybe increased threshold to decrease amount of points for better performance?
+    # akaze = cv.xfeatures2d.AKAZE_create(threshold=0.003)
+    akaze = cv.xfeatures2d.AKAZE_create()
+    # akaze = cv.SIFT_create()    # Experiment with SIFT
+    kp1, desc1 = akaze.detectAndCompute(left_img_gray, mask=left_mask)
+    kp2, desc2 = akaze.detectAndCompute(right_img_gray, mask=None)
+
+    if desc1 is None or desc2 is None or len(kp1) < 8 or len(kp2) < 8:
+        raise RuntimeError("AKAZE: Not enough feature points found for matching.")
+
+    matcher = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)  # For AKAZE
+    # matcher = cv.BFMatcher(cv.NORM_L2, crossCheck=True)  # For SIFT
+    matches = matcher.match(desc1, desc2)
+
+    if len(matches) < 8:
+        raise RuntimeError("AKAZE: Not enough valid matches found.")
+
+    # DEBUG: Amount of keypoints filtered by BF Matcher
+    print(f"Keypoints removed by BF Matcher: {len(kp1) - len(matches)}")
+
+    akaze_pts_left = np.array([kp1[m.queryIdx].pt for m in matches], dtype=np.float32)
+    akaze_pts_right = np.array([kp2[m.trainIdx].pt for m in matches], dtype=np.float32)
+
+    # DEBUG: Number of keypoints found
+    print(f"Found {len(akaze_pts_left)} keypoints.")
+
+    return akaze_pts_left, akaze_pts_right
+
+
+def _filterStereoKeyPoints_(akaze_pts_left, akaze_pts_right, calData):
+    if calData is None:
+        raise ValueError("Calibration data ('calData') is incorrect or missing.")
+
+    # Epipolar filtering
+    mask_epipolar = _getEpipolarMask_(akaze_pts_left, akaze_pts_right, calData, Threshold=50.0)
+    if mask_epipolar is None or np.sum(mask_epipolar) == 0:
+        raise RuntimeError("AKAZE: Epipolar filtering failed.")
+
+    # DEBUG: Amount of keypoints filtered by epipolar constraint
+    print(f"Keypoints removed by Epipolar Constraint: {len(akaze_pts_left) - np.sum(mask_epipolar)}")
+
+    valid_epi = (mask_epipolar.ravel() == 1)
+    akaze_pts_left = akaze_pts_left[valid_epi]
+    akaze_pts_right = akaze_pts_right[valid_epi]
+
+    return akaze_pts_left, akaze_pts_right
+
+
+# TODO: Rewrite to use multiple cores, as each subset is independent.
+# TODO: Maybe vectorise it and use workers=N_CORES
+def _estimateSubSetsAkaze_(subSetPnts_left, subSetPnts_right, akaze_left, akaze_right, N_neighbors, search_radius):
     """
-    Filters points based on the Interquartile Range (IQR) of their Z-coordinates.
-    factor: 1.5 is standard, 1.0 is aggressive, 2.0 is conservative.
+    Estimate the first order shape function parameters for the right image subsets using
+    AKAZE keypoints.
+
+    Fallback strategy:
+    1. Use the N neighbours if they are within the search radius (defaults to subset size).
+    2. Else use the N nearest neighbours if the total number of keypoints >= N.
+    3. Else use a least squares fit over the keypoints.
+
+    Parameters:
+        subSetPnts_left (ndarray): The reference left image subset array.
+        subSetPnts_right (ndarray): The initial right image subset array. Copy of subSetPnts_left if None.
+        akaze_left (ndarray): The array of left image AKAZE keypoints.
+        akaze_right (ndarray):: The array of left image AKAZE keypoints.
+        N_neighbors: Number of neighbouring keypoints to use for RANSAC model fitting.
+        search_radius: The pixel radius around the subset centre used to search for keypoints.
+    Returns:
+        subSetPnts_right (ndarray): Array of subset points with estimated shape function
+                                    parameters for the right image.
+
+    Raises:
+        RuntimeError: If not enough keypoints are provided.
     """
-    z = points_3d[:, 2]
-    q25, q75 = np.percentile(z, [25, 75])
-    iqr = q75 - q25
+    if len(akaze_left) < 7:
+        raise RuntimeError("RANSAC: At least 7 keypoints are required.")
 
-    lower_bound = q25 - (factor * iqr)
-    upper_bound = q75 + (factor * iqr)
+    # Create initial right image subsets by copying left image subsets if none are given.
+    if subSetPnts_right is None:
+        subSetPnts_right = np.copy(subSetPnts_left)
 
-    mask = ((z >= lower_bound) & (z <= upper_bound)).astype(np.uint8)
-    return mask
+    # Create KDTree for left keypoints
+    tree = KDTree(akaze_left)
+    # Number of subset rows and columns
+    rows, cols = subSetPnts_left.shape[:2]
 
-from scipy.spatial import KDTree
-def filter_outliers_sor(points_3d, k=15, std_ratio=1.0):
-    """
-    Statistical Outlier Removal (SOR).
-    k: Number of nearest neighbors to evaluate.
-    std_ratio: Standard deviation multiplier threshold.
-    """
-    tree = KDTree(points_3d)
-    # Query distance to k nearest neighbors
-    distances, _ = tree.query(points_3d, k=k+1)
+    # For each left image subset
+    for iRow in range(rows):
+        for iCol in range(cols):
+            # Get left image subset x and y coordinates
+            x = subSetPnts_left[iRow, iCol, CompID.XCoordID]
+            y = subSetPnts_left[iRow, iCol, CompID.YCoordID]
 
-    # Average distance to neighbors (excluding self at index 0)
-    mean_distances = np.mean(distances[:, 1:], axis=1)
+            # Ignore if subset is invalid
+            if np.isnan(x) or np.isnan(y):
+                continue
 
-    # Calculate threshold based on global distribution
-    global_mean = np.mean(mean_distances)
-    global_std = np.std(mean_distances)
-    threshold = global_mean + (std_ratio * global_std)
+            # Find N keypoints within the search radius
+            idxs = tree.query_ball_point([x, y], search_radius)
+            idxs = np.atleast_1d(idxs)
 
-    mask = (mean_distances < threshold).astype(np.uint8)
-    return mask
+            # If there are not enough keypoints within the search radius
+            if len(idxs) < N_neighbors:
+                # print(f"DEBUG: Fell through to KNN at [{x}, {y}]")
+                # Find N nearest keypoints to subset x,y position
+                dists, idxs = tree.query([x, y], k=N_neighbors)
+                idxs = np.atleast_1d(idxs)
 
+            # Extract keypoints that will be used to fit the RANSAC model
+            src_pts = akaze_left[idxs]
+            dst_pts = akaze_right[idxs]
+
+            # Perform RANSAC model fitting to estimate affine parameters
+            # RANSAC requires at least 7 samples
+            if len(idxs) >= N_neighbors:
+                model, inliers = sk.measure.ransac(
+                    (src_pts, dst_pts),
+                    sk.transform.AffineTransform,
+                    min_samples=3,  # Requires at least 3 samples to be solvable
+                    residual_threshold=2.0,
+                    max_trials=100
+                )
+            else:
+                print(f"DEBUG: Fell through to LSM at [{x}, {y}]")
+                # If there are not enough keypoints, perform a least squares fit
+                model = sk.transform.AffineTransform()
+                model.from_estimate(dst_pts)  # Not sure if this is a good idea?
+
+            # Apply estimated affine parameters to right image subsets
+            if model is not None and model.params is not None:
+                # | x'|   | a0 a1 a2 | | x |
+                # | y'| = | b0 b1 b2 | | y |
+                # | 1 |   | 0  0  1  | | 1 |
+                # x' = a0 * x + a1 * y + a2
+                x_prime = model.params[0, 0] * x + model.params[0, 1] * y + model.params[0, 2]
+                # y' = b0 * x + b1 * y + b2
+                y_prime = model.params[1, 0] * x + model.params[1, 1] * y + model.params[1, 2]
+                #            | 1+p2  p3   p1 | | x |
+                # W(x,y,p) = |  p5  1+p6  p4 | | y |
+                #            |  0    0    1  | | 1 |
+                subSetPnts_right[iRow, iCol, CompID.XDispID + 0] = x_prime - x               # p1
+                subSetPnts_right[iRow, iCol, CompID.XDispID + 1] = model.params[0, 0] - 1.0  # p2
+                subSetPnts_right[iRow, iCol, CompID.XDispID + 2] = model.params[0, 1]        # p3
+
+                subSetPnts_right[iRow, iCol, CompID.YDispID + 0] = y_prime - y               # p4
+                subSetPnts_right[iRow, iCol, CompID.YDispID + 1] = model.params[1, 0]        # p5
+                subSetPnts_right[iRow, iCol, CompID.YDispID + 2] = model.params[1, 1] - 1.0  # p6
+
+    return subSetPnts_right
+
+
+# TODO: Rewrite so that it supports multiple strategies
+# TODO: Rewrite so that it will perform stereo matching using existing subsets
+#       i.e.: stereo match each stereo image pair
 def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     """
     Perform stereo matching between the leftImg (reference) and rightImg
@@ -401,7 +527,8 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     tempFolderPath = os.path.join(os.getcwd(), "sm_temp")
     if os.path.exists(tempFolderPath):
         shutil.rmtree(tempFolderPath)
-        os.makedirs(tempFolderPath, exist_ok=True)
+
+    os.makedirs(tempFolderPath, exist_ok=True)
 
     # Check if left and right images exist
     if not os.path.exists(leftImg) or not os.path.exists(rightImg):
@@ -412,7 +539,7 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     shutil.copyfile(rightImg, os.path.join(tempFolderPath, "sm_img_1.tif"))
 
     # # Just for testing
-    # histMatch=True
+    # histMatch = True
     # if histMatch:
     #     left_img_to_process = cv.imread(leftImg, cv.IMREAD_GRAYSCALE)
     #     right_img_to_process = cv.imread(rightImg, cv.IMREAD_GRAYSCALE)
@@ -431,6 +558,7 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     sm_settings.DatumImage = 0
     sm_settings.TargetImage = -1
     sm_settings.Increment = 1
+    sm_settings.StartingPoints = 0  # Disable initial shape function parameter estimation
     resultsPath = os.path.join(tempFolderPath, "sm_results.sdic")
 
     # Get the Region of Interest (ROI) for the left image
@@ -445,105 +573,56 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     if initSubSetPnts_left.size == 0:
         raise ValueError("No valid subset centers could be created for the specified ROI/subset size.")
 
-    # plotSubSetsOnImage(leftImg,
-    #                    initSubSetPnts_left,
-    #                    applyDeformation=True,
-    #                    showCenters=True,
-    #                    maxSubSets=None,
-    #                    fileName="subsets.png",
-    #                    showPlot=True)
+    # DEBUG: Plot initial left subsets on image
+    plotSubSetsOnImage(leftImg,
+                       initSubSetPnts_left,
+                       applyDeformation=True,
+                       showCenters=True,
+                       maxSubSets=None,
+                       title="Initial left image subsets",
+                       fileName="initSubSetPnts_left.png",
+                       showPlot=True)
 
-    # -------------------------------------------------------------------
-    # Apply perspective transformation using AKAZE depth estimation
-    # -------------------------------------------------------------------
-    # Check if calData is present
-    if calData is None:
-        raise ValueError("Calibration data ('calData') is incorrect or missing.")
+    # Get AKAZE keypoints
+    print("Get AKAZE keypoints")
+    sdic._tic_()
+    # Elapsed time is 5.5641326904296875 seconds.
+    akaze_left, akaze_right = _getStereoKeyPoints_(leftImg, rightImg, ROI)
+    sdic._toc_()
 
-    # 1. Load images for AKAZE feature detection
-    left_img_gray = sdic.readImage(leftImg)
-    right_img_gray = sdic.readImage(rightImg)
+    # TODO: Implement keypoint subsampling
 
-    # Create a binary mask for the left image based on the ROI
-    # ROI format from _setupROI_ is [XStart, YStart, XLength, YLength]
-    x_start, y_start, w, h = ROI
-    left_mask = np.zeros_like(left_img_gray, dtype=np.uint8)
-    left_mask[y_start:y_start+h, x_start:x_start+w] = 255
+    # Filter keypoints
+    print("Filter keypoints")
+    sdic._tic_()
+    # Elapsed time is 0.0025370121002197266 seconds.
+    akaze_left, akaze_right = _filterStereoKeyPoints_(akaze_left, akaze_right, calData)
+    sdic._toc_()
 
-    # 2. Detect AKAZE features
-    akaze = cv.xfeatures2d.AKAZE_create()
-    # akaze = cv.SIFT.create()
-    kp1, desc1 = akaze.detectAndCompute(left_img_gray, mask=left_mask)
-    kp2, desc2 = akaze.detectAndCompute(right_img_gray, mask=None)
+    # DEBUG: Plot keypoints in 3D
+    # plotPoints3D(points_3d, fileName="keypoints_3d.png", showPlot=True, set_aspect="equal")
 
-    if desc1 is not None and desc2 is not None and len(kp1) > 0 and len(kp2) > 0:
-        # Match features
-        matcher = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)
-        # matcher = cv.BFMatcher(cv.NORM_L2, crossCheck=True)
-        matches = matcher.match(desc1, desc2)
+    # Estimate right image subset parameters using keypoints
+    print("Estimate right image subset parameters")
+    N_neighbors = 14
+    search_radius = subSetSize / np.sqrt(2)  # Search circle around subset
+    sdic._tic_()
+    initSubSetPnts_right = _estimateSubSetsAkaze_(initSubSetPnts_left, None, akaze_left, akaze_right, N_neighbors, search_radius)
+    sdic._toc_()
 
-        if len(matches) >= 8:  # Need at least _ points for affine and _ points for quadratic
-            # Extract coordinates of matches
-            akaze_pts_left = np.array([kp1[m.queryIdx].pt for m in matches])
-            akaze_pts_right = np.array([kp2[m.trainIdx].pt for m in matches])
+    # Create and export 3D mesh
+    # _ = _createMesh3D_(points_3d, export=True)
 
-            # Filter outlier matches using epipolar constraints
-            mask_epipolar = _getEpipolarMask_(akaze_pts_left, akaze_pts_right, calData, Threshold=2.0)
-            # breakpoint()
-
-            if mask_epipolar is not None and np.sum(mask_epipolar) > 0:
-                akaze_pts_left = akaze_pts_left[mask_epipolar.ravel() == 1]
-                akaze_pts_right = akaze_pts_right[mask_epipolar.ravel() == 1]
-
-                # Triangulate matched points to get actual 3D depths
-                points_3d = _triangulatePoints_(akaze_pts_left, akaze_pts_right, calData)
-
-                # Filter outliers
-                mask_sor = filter_outliers_sor(points_3d, k=5, std_ratio=1.0)
-                points_3d = points_3d[mask_sor.ravel() == 1]
-
-                # plotPoints3D(points_3d, fileName="points_3d.png", showPlot=True, set_aspect="equal")
-                # # Use median Z to ignore remaining outliers
-                # Z_guess = np.nanmedian(points_3d[:, 2])
-
-                # if sm_settings.DebugLevel >= 1:
-                #     print(f"AKAZE: Estimated specimen depth (Z) = {Z_guess:.2f}")
-            else:
-                if sm_settings.DebugLevel >= 1:
-                    print("AKAZE: epipolar filtering failed.")
-        else:
-            if sm_settings.DebugLevel >= 1:
-                print("AKAZE: Not enough matches found.")
-
-    # # 3. Extract the 2D coordinates from the left subsets
-    # pts_left = np.stack((
-    #     initSubSetPnts_left[:, :, CompID.XCoordID].flatten(),
-    #     initSubSetPnts_left[:, :, CompID.YCoordID].flatten()
-    # ), axis=1).astype(np.float32)
-
-    # # 4. Undistort points to normalized camera coordinates (rays)
-    # K1, D1 = calData["K1"], calData["D1"]
-    # K2, D2 = calData["K2"], calData["D2"]
-    # R, T = calData["R"], calData["T"]
-    # pts_left_norm = cv.undistortPoints(pts_left, K1, D1).reshape(-1, 2)
-
-    # # 5. Convert normalized rays to 3D points using our AKAZE-estimated Z
-    # pts_3d_left = np.hstack((pts_left_norm, np.ones((pts_left_norm.shape[0], 1)))) * Z_guess
-
-    # # 6. Project the 3D points onto the right camera's image plane
-    # pts_right_proj, _ = cv.projectPoints(pts_3d_left, R, T, K2, D2)
-    # pts_right_proj = pts_right_proj.reshape(-1, 2)
-
-    # # 7. Apply the projected coordinates to the right subset array
-    # initSubSetPnts_right = np.copy(initSubSetPnts_left)
-    # data_shape = initSubSetPnts_left[:, :, CompID.XCoordID].shape
-
-    # initSubSetPnts_right[:, :, CompID.XCoordID] = pts_right_proj[:, 0].reshape(data_shape)
-    # initSubSetPnts_right[:, :, CompID.YCoordID] = pts_right_proj[:, 1].reshape(data_shape)
-    # # -------------------------------------------------------------------
-
+    # DEBUG: Plot initial right image subset points before matching
+    plotSubSetsOnImage(rightImg,
+                       initSubSetPnts_right,
+                       applyDeformation=True,
+                       showCenters=True,
+                       maxSubSets=None,
+                       title="Initial right image subset estimates",
+                       fileName="initSubSetPnts_right.png",
+                       showPlot=True)
     # breakpoint()
-    initSubSetPnts_right = initSubSetPnts_left
 
     # Perform temporal matching to get the right image subset coordinates and
     # displacements
@@ -557,7 +636,8 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
         results = results[~np.isnan(results).any(axis=1)]
         foundPoints = results.shape[0]
         totalPoints = nRows * nCols
-        print(f"Found {foundPoints}/{totalPoints} subsets. Missing: {totalPoints - foundPoints}")
+        missingPoints = totalPoints - foundPoints
+        print(f"Found {foundPoints}/{totalPoints} subsets. Missing: {missingPoints}")
 
     # 3. Post-processing
     # Update right subset coordinates with calculated displacements
@@ -571,25 +651,22 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     leftSubSetPnts[:, :, CompID.CZNSSDID] = IntConst.CNZSSD_MAX
 
     # Optionally fill missing subsets
-    if fillMissing:
+    # TODO: Make filling more robust
+    # TODO: Implement OpenCorr regional fitting
+    if fillMissing and missingPoints:
         rightSubSetPnts = _fillMissingSubsets_(rightSubSetPnts)
         if sm_settings.DebugLevel >= 1:
             print("Filled in missing subsets for right image.")
 
-    # plotSubSetsOnImage(rightImg,
-    #                    rightSubSetPnts,
-    #                    applyDeformation=True,
-    #                    showCenters=True,
-    #                    maxSubSets=None,
-    #                    fileName="subsets.png",
-    #                    showPlot=True)
-
-    # breakpoint()
-
-    # Force all the subset point coordinates to be ints
-    # Warning, may cause errors. Update: Did cause major errors
-    # rightSubSetPnts[:, :, CompID.XCoordID] = np.round(rightSubSetPnts[:, :, CompID.XCoordID])
-    # rightSubSetPnts[:, :, CompID.YCoordID] = np.round(rightSubSetPnts[:, :, CompID.YCoordID])
+    # DEBUG: Plot right image subsets on image after stereo matching
+    plotSubSetsOnImage(rightImg,
+                       rightSubSetPnts,
+                       applyDeformation=True,
+                       showCenters=True,
+                       maxSubSets=None,
+                       title="Initial right image subsets after matching",
+                       fileName="matchedSubSetPnts_right.png",
+                       showPlot=True)
 
     # 4. Cleanup
     if sm_settings.DebugLevel < 2:
@@ -604,6 +681,8 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
 # stereo calibration or read it from a csv file using sc.getDataFromParametersCSV(calCSV)
 # TODO: Add option in settings to fillMissing subset points
 # TODO: Use ray to run temporalMatch in parallel
+# TODO: Implement and use absolute DIC strategy
+# TODO: Rewrite the function to make use of files instead of memory
 def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
 
     # 1. Get left and right image sets
@@ -629,6 +708,28 @@ def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
         print("Performing temporal matching on the right image set...")
     results_right = sdic._temporalMatch_(rightSubSetPnts_init, rightImgSet, settings, "tm_results_right.sdic")
 
+    # DEBUG: Plot final left image SubSetPnts
+    finalLeftImg = leftImgSet[settings.TargetImage]
+    plotSubSetsOnImage(finalLeftImg,
+                       results_left[-1],
+                       applyDeformation=True,
+                       showCenters=True,
+                       maxSubSets=None,
+                       title="Final left image subsets",
+                       fileName="finalSubSetPnts_left.png",
+                       showPlot=True)
+
+    # DEBUG: Plot final right image SubSetPnts
+    finalRightImg = rightImgSet[settings.TargetImage]
+    plotSubSetsOnImage(finalRightImg,
+                       results_right[-1],
+                       applyDeformation=True,
+                       showCenters=True,
+                       maxSubSets=None,
+                       title="Final right image subsets",
+                       fileName="finalSubSetPnts_right.png",
+                       showPlot=True)
+
     # 6. Perform coordinate system transform to transform the displacements from
     #    the left image plane and right image plane (2D) to the world
     #    coordinates (3D)
@@ -639,21 +740,25 @@ def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
     if imgTarget == -1:
         imgTarget = len(leftImgSet) - 1
     imgIncr = settings.Increment
-    imgPairs = int((imgTarget - imgDatum) / imgIncr)
+    # imgPairs = int((imgTarget - imgDatum) / imgIncr)
+
+    # TODO: Create new data structure for world results
 
     # Prepare results file writer for stereo results
     df = dataFile.DataFile.openWriter(resultsFile)
     df.writeHeading(settings)
 
     returnData = []
-    # Initial triangulation — always from imgDatum
+    # Initial triangulation, always from imgDatum
     worldSubSetPnts_ref = _triangulateSubSets_(leftSubSetPnts_init, rightSubSetPnts_init, calData)
     worldSubSetPnts_out = np.copy(worldSubSetPnts_ref)
 
+    # For each stereo image pair, perform least-squares triangulation on the
+    # left and right subset points to get the world subset points
     for imgPairIdx, img in enumerate(range(imgDatum, imgTarget, imgIncr)):
         print(f"imgPairIdx: {imgPairIdx}, img: {img}")
-        # For each stereo image pair, perform least-squares triangulation on the
-        # left and right subset points to get the world subset points
+
+        # Get left and right image subsets
         leftSubSetPnts = results_left[imgPairIdx]
         rightSubSetPnts = results_right[imgPairIdx]
 
@@ -675,31 +780,23 @@ def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
         # The _triangulateSubSets_ function returns the a subSetPnts array
         # containing the newly triangulated x,y and z coordinates, but doesn't
         # touch displacement
-        # worldSubSetPnts = _triangulateSubSets_(leftSubSetPnts, rightSubSetPnts, calData)
 
         # Triangulate current stereo pair
         worldSubSetPnts = _triangulateSubSets_(leftSubSetPnts, rightSubSetPnts, calData)
 
-        # Calculate displacements from the reference (either absolute or previous)
-        worldSubSetPnts_out[:, :, CompID.XDispID] = worldSubSetPnts[:, :, CompID.XCoordID] - worldSubSetPnts_ref[:, :, CompID.XCoordID]
-        worldSubSetPnts_out[:, :, CompID.YDispID] = worldSubSetPnts[:, :, CompID.YCoordID] - worldSubSetPnts_ref[:, :, CompID.YCoordID]
-        worldSubSetPnts_out[:, :, CompID.ZDispID] = worldSubSetPnts[:, :, CompID.ZCoordID] - worldSubSetPnts_ref[:, :, CompID.ZCoordID]
+        # Calculate displacements from the reference
+        worldSubSetPnts_out[:, :, StereoCompID.XDispID] = worldSubSetPnts[:, :, StereoCompID.XCoordID] - worldSubSetPnts_ref[:, :, StereoCompID.XCoordID]
+        worldSubSetPnts_out[:, :, StereoCompID.YDispID] = worldSubSetPnts[:, :, StereoCompID.YCoordID] - worldSubSetPnts_ref[:, :, StereoCompID.YCoordID]
+        worldSubSetPnts_out[:, :, StereoCompID.ZDispID] = worldSubSetPnts[:, :, StereoCompID.ZCoordID] - worldSubSetPnts_ref[:, :, StereoCompID.ZCoordID]
 
+        # TODO: Figure out if the subset coordinates are ever updated in SUN-DIC, as it doesn't seem so
         # Update coordinates from triangulation
-        worldSubSetPnts_out[:, :, CompID.XCoordID] = worldSubSetPnts[:, :, CompID.XCoordID]
-        worldSubSetPnts_out[:, :, CompID.YCoordID] = worldSubSetPnts[:, :, CompID.YCoordID]
-        worldSubSetPnts_out[:, :, CompID.ZCoordID] = worldSubSetPnts[:, :, CompID.ZCoordID]
+        # worldSubSetPnts_out[:, :, CompID.XCoordID] = worldSubSetPnts[:, :, CompID.XCoordID]
+        # worldSubSetPnts_out[:, :, CompID.YCoordID] = worldSubSetPnts[:, :, CompID.YCoordID]
+        # worldSubSetPnts_out[:, :, CompID.ZCoordID] = worldSubSetPnts[:, :, CompID.ZCoordID]
 
         # TODO: Ask Prof. Venter why the subset coordinates are always set to
         # their initial positions?
-
-        if settings.isRelativeStrategy():
-            # Update the reference subSetPnts when using relative strategy
-            worldSubSetPnts_ref = np.copy(worldSubSetPnts)
-            # Update coordinates from triangulation
-            # worldSubSetPnts[:, :, CompID.XCoordID] = worldSubSetPnts_new[:, :, CompID.XCoordID]
-            # worldSubSetPnts[:, :, CompID.YCoordID] = worldSubSetPnts_new[:, :, CompID.YCoordID]
-            # worldSubSetPnts[:, :, CompID.ZCoordID] = worldSubSetPnts_new[:, :, CompID.ZCoordID]
 
         # Write this frame's results to the results file
         df.writeSubSetData(imgPairIdx, worldSubSetPnts_out)
@@ -711,9 +808,11 @@ def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
     return returnData
 
 
-def plotSubSetsOnImage(img, subSetPnts, applyDeformation=True, showCenters=True, maxSubSets=None, fileName="subsets.png", showPlot=True):
+# The following function has been generated using Gemini.
+# TODO: Implement into sundic postprocessing
+def plotSubSetsOnImage(img, subSetPnts, applyDeformation=True, showCenters=True, maxSubSets=None, title="DIC Subsets on Image", fileName="subsets.png", showPlot=True):
     """
-    Plots the subsets on the provided image with their correct (deformed) shapes.
+    Plots the subsets on the provided image with their deformed shapes.
 
     Parameters:
         - img: Image file path (str) or loaded image array (ndarray).
@@ -811,7 +910,7 @@ def plotSubSetsOnImage(img, subSetPnts, applyDeformation=True, showCenters=True,
             cy = y0 + p[6]
             ax.plot(cx, cy, marker='+', color='blue', markersize=5)
 
-    ax.set_title("DIC Subsets on Image")
+    ax.set_title(title)
     ax.set_xlabel("X (pixels)")
     ax.set_ylabel("Y (pixels)")
     ax.set_aspect('equal')
@@ -826,6 +925,8 @@ def plotSubSetsOnImage(img, subSetPnts, applyDeformation=True, showCenters=True,
         plt.show()
     else:
         plt.close(fig)
+
+    return fig, ax
 
 
 def plotStereoSubSets2D(leftSubSetPnts, rightSubSetPnts, fileName="subset_points_2d.png", showPlot=False):
@@ -864,9 +965,11 @@ def plotStereoSubSets2D(leftSubSetPnts, rightSubSetPnts, fileName="subset_points
 
     # Show plot window
     if showPlot:
-        plt.show(fig)
+        plt.show()
     else:
         plt.close(fig)
+
+    return fig
 
 
 def plotSubSets3D(worldSubSetPnts, fileName="subset_points_3d.png", showPlot=False, set_aspect="auto"):
@@ -885,9 +988,9 @@ def plotSubSets3D(worldSubSetPnts, fileName="subset_points_3d.png", showPlot=Fal
     """
     # Extract 3D coordinates
     pts = np.stack((
-        worldSubSetPnts[:, :, CompID.XCoordID].flatten(),
-        worldSubSetPnts[:, :, CompID.YCoordID].flatten(),
-        worldSubSetPnts[:, :, CompID.ZCoordID].flatten()
+        worldSubSetPnts[:, :, StereoCompID.XCoordID].flatten(),
+        worldSubSetPnts[:, :, StereoCompID.YCoordID].flatten(),
+        worldSubSetPnts[:, :, StereoCompID.ZCoordID].flatten()
     ), axis=1)
 
     # Remove invalid points (NaN or Inf)
@@ -919,9 +1022,11 @@ def plotSubSets3D(worldSubSetPnts, fileName="subset_points_3d.png", showPlot=Fal
     plt.savefig(fileName)
     print(f"Plot saved to '{fileName}'")
     if showPlot:
-        plt.show(fig)
+        plt.show()
     else:
         plt.close(fig)
+
+    return fig, ax
 
 
 def plotDispContour3D(worldSubSetPnts,
@@ -942,20 +1047,20 @@ def plotDispContour3D(worldSubSetPnts,
     """
     # Map component selection to index
     disp_map = {
-        "x": CompID.XDispID,
-        "y": CompID.YDispID,
-        "z": CompID.ZDispID,
+        "x": StereoCompID.XDispID,
+        "y": StereoCompID.YDispID,
+        "z": StereoCompID.ZDispID,
     }
 
     # Extract 3D coordinates
-    x = worldSubSetPnts[:, :, CompID.XCoordID].flatten()
-    y = worldSubSetPnts[:, :, CompID.YCoordID].flatten()
-    z = worldSubSetPnts[:, :, CompID.ZCoordID].flatten()
+    x = worldSubSetPnts[:, :, StereoCompID.XCoordID].flatten()
+    y = worldSubSetPnts[:, :, StereoCompID.YCoordID].flatten()
+    z = worldSubSetPnts[:, :, StereoCompID.ZCoordID].flatten()
 
     # Get displacements
-    dx = worldSubSetPnts[:, :, CompID.XDispID].flatten()
-    dy = worldSubSetPnts[:, :, CompID.YDispID].flatten()
-    dz = worldSubSetPnts[:, :, CompID.ZDispID].flatten()
+    dx = worldSubSetPnts[:, :, StereoCompID.XDispID].flatten()
+    dy = worldSubSetPnts[:, :, StereoCompID.YDispID].flatten()
+    dz = worldSubSetPnts[:, :, StereoCompID.ZDispID].flatten()
 
     # Determine displacement values for coloring
     if dispComp == "mag":
@@ -1004,6 +1109,8 @@ def plotDispContour3D(worldSubSetPnts,
         plt.show()
     else:
         plt.close()
+
+    return fig, ax
 
 
 def plotPoints3D(points_3d, fileName="points_3d.png", showPlot=False, set_aspect="auto"):
@@ -1079,3 +1186,5 @@ def plotPoints3D(points_3d, fileName="points_3d.png", showPlot=False, set_aspect
         plt.show()
     else:
         plt.close(fig)
+
+    return fig, ax
