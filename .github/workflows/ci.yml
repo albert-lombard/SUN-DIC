@@ -1,12 +1,16 @@
-name: SUN-DIC daily check
+name: SUN-DIC CI & Daily Check
 
 on:
-  schedule:
-    - cron: "0 3 * * *"   # daily at 03:00 UTC
-  workflow_dispatch:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+
+permissions:
+  contents: read
 
 jobs:
-  daily-check:
+  test:
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -17,25 +21,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: 'pip'
 
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      - name: Install package requirements
-        run: python -m pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
 
       - name: Install SUN-DIC package
         run: python -m pip install . --no-cache-dir
 
-      - name: Install pytest (test-only dependency)
-        run: python -m pip install pytest
-
       - name: Copy example files
         run: copy-examples
 
-      - name: Run daily SUN-DIC smoke test
+      - name: Run SUN-DIC tests
         run: pytest -q sundic/tests/daily_test.py -s

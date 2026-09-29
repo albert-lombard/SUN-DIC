@@ -6,10 +6,10 @@
 # Date: 2025/04/14
 ################################################################################
 
-from pathlib import Path
-import shutil
 import argparse
+import shutil
 from importlib.resources import files
+from pathlib import Path
 
 
 def _copy_resource(source, target: Path) -> None:
@@ -68,7 +68,7 @@ def copy_examples(include_manual: bool = False) -> list[Path]:
             _copy_resource(source, target)
             print(f"Copied {resource} -> {target}")
             copied_paths.append(target)
-        except Exception as exc:
+        except OSError as exc:
             print(f"Error copying {resource}: {exc}")
 
     return copied_paths

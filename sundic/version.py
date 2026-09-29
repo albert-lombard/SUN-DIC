@@ -1,4 +1,16 @@
-__version__ = "0.0.35"
+__version__ = "0.0.36b"
+# 0.0.37 - Sort out ruff linting errors and warnings
+#        -
+# 0.0.36 - Added ruff linting and formatting
+#        - Changed daily checks to run when push/pull requests are received
+#        - Disabled fastmath in interpolator
+#        - Dependency mangement - add version ceiling and ignore minor updates
+#        - Changed minimum python version to 3.12 from 3.11
+#        - Added the compress datafile and file output options to the GUI
+#        - Merged the changes to split the planarDICLocal function into two
+#          functions to better support the stereo DIC implementation
+#        - Updated daily check to include dev branch
+#        - Updated the readme file to include links to MOD research group
 # 0.0.35 - Quick fix to handle compressed data in the datafile from the GUI
 # 0.0.34 - Update the readme file and user manual to reflect new functionality from
 #          version 0.0.33.
@@ -6,7 +18,7 @@ __version__ = "0.0.35"
 #        - Added an option to only save the required data for post-porocessing and to
 #          compress the results file to save disk space
 # 0.0.33 - Resolved dependency issue with headless opencv and AKAZE
-#        - Add post-processing functions to obtain displacement and strain time history 
+#        - Add post-processing functions to obtain displacement and strain time history
 #          at specific points.  Both data and plots can be generated.
 #        - Updated the example Jupyter notebook file and manual accordingly.
 #        - Updated the GUI to support this new functionality as well.
@@ -33,9 +45,9 @@ __version__ = "0.0.35"
 # 0.0.27 - Updated copy_examples
 #        - Added dilation support for displacement field to post-processing to help create
 #          exclusion zone around automatically detected boundaries in the ROI
-#        - Added dilation support to GUI as well 
+#        - Added dilation support to GUI as well
 #        - Update ROI in GUI to work with latest PyQT libraries
-# 0.0.26 - Updated requirements file and added pyproject.toml installation 
+# 0.0.26 - Updated requirements file and added pyproject.toml installation
 #          support
 # 0.0.25 - Fixed bug in post-processing that caused an exception when
 #          not enough matched subsets were found for smoothing
