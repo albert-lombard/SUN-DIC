@@ -106,6 +106,7 @@ def _correct_board_orientation_(corners, pattern_size):
     return grid.reshape(-1, 1, 2)
 
 
+# --------------------------------------------------------------------------------
 # The problem with the following function is that it sets the reference
 # orientation of the grid to that of the first image, even if the first image
 # has an orientation that differs with the rest of the images. Works ok for now.
@@ -259,7 +260,7 @@ def calibrateCheckerboard(boardSize, squareSize, leftImages, rightImages, fileNa
     # If debug images are to be saved, create a directory for output
     if debugLevel == 2:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        debug_dir = f"../debug/corners_{timestamp}_{boardSize[0]}x{boardSize[1]}"
+        debug_dir = f"debug/corners_{timestamp}_{boardSize[0]}x{boardSize[1]}"
         os.makedirs(debug_dir, exist_ok=True)
 
     # Process results from corner detection
