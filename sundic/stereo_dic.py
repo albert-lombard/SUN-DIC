@@ -1,8 +1,10 @@
+# Import built-in libraries
 import copy
 import os
 import shutil
 from enum import IntEnum
 
+# Import external libraries
 import cv2 as cv
 import skimage as sk
 import matplotlib.pyplot as plt
@@ -17,6 +19,11 @@ from scipy.interpolate import griddata
 from scipy.spatial import KDTree
 
 
+# ====================
+#      Constants
+# ====================
+
+
 # Define integer constants for accessing the subset stereo data array
 class StereoCompID(IntEnum):
     XCoordID = 0   # The x-coordinate of the subset center point
@@ -28,6 +35,12 @@ class StereoCompID(IntEnum):
     ProjErrID = 6   # The reprojection error of the subset point
 
 
+# ====================
+#      Functions
+# ====================
+
+
+# --------------------------------------------------------------------------------
 # TODO: Check if there are any images
 def getStereoImageList(folderPath, debugLevel=0):
     """
@@ -110,7 +123,7 @@ def getStereoImageList(folderPath, debugLevel=0):
     return leftImgSet, rightImgSet
 
 
-# TODO: Also return repropjection error
+# --------------------------------------------------------------------------------
 def _triangulatePoints_(leftPts, rightPts, calData):
     """
     Triangulate a 3D points from corresponding set of 2D points.
@@ -124,8 +137,11 @@ def _triangulatePoints_(leftPts, rightPts, calData):
         - calData (dict): Dictionary containing stereo calibration data.
 
     Returns:
-        - points_3d (ndarray): Array of triangulated 3D points in left
-                               camera coordinates. Shape: (N, 3)
+        - tuple (points_3d, reproj_error)
+          - points_3d (ndarray): Array of triangulated 3D points in left camera
+                                 coordinates. Shape: (N, 3)
+          - reproj_error (ndarray): RMS reprojection error across the two images
+                                    for each point, in pixels. Shape: (N, 1)
     """
     # Extract intrinsic and distortion parameters
     K1, D1 = calData["K1"], calData["D1"]
@@ -187,6 +203,7 @@ def _triangulatePoints_(leftPts, rightPts, calData):
     return points_3d, reproj_error
 
 
+# --------------------------------------------------------------------------------
 def _triangulateSubSets_(leftSubSetPnts, rightSubSetPnts, calData):
     """
     Triangulates left and right subset points and returns subset points in world
@@ -235,6 +252,7 @@ def _triangulateSubSets_(leftSubSetPnts, rightSubSetPnts, calData):
     return worldSubSetPnts
 
 
+# --------------------------------------------------------------------------------
 def _fillMissingSubsets_(subSetPnts, method='cubic'):
     """
     Fill NaNs in X and Y coordinate fields of subSetPnts using grid interpolation.
@@ -259,6 +277,48 @@ def _fillMissingSubsets_(subSetPnts, method='cubic'):
     return subSetPnts
 
 
+# --------------------------------------------------------------------------------
+# TODO: doc string
+# TODO: Why is 8 selected as the minimum keypoints here?
+def _getStereoKeyPoints_(leftImg, rightImg, ROI):
+    # Read and normalize the images to be in the range 0-255
+    left_img_gray = sdic.readImage(leftImg, normalize8Bit=True)
+    right_img_gray = sdic.readImage(rightImg, normalize8Bit=True)
+
+    x_start, y_start, w, h = ROI
+    left_mask = np.zeros_like(left_img_gray, dtype=np.uint8)
+    left_mask[y_start:y_start+h, x_start:x_start+w] = 255
+
+    # TODO: Maybe increased threshold to decrease amount of points for better performance?
+    # akaze = cv.xfeatures2d.AKAZE_create(threshold=0.003)
+    akaze = cv.xfeatures2d.AKAZE_create()
+    # akaze = cv.SIFT_create()    # Experiment with SIFT
+    kp1, desc1 = akaze.detectAndCompute(left_img_gray, mask=left_mask)
+    kp2, desc2 = akaze.detectAndCompute(right_img_gray, mask=None)
+
+    if desc1 is None or desc2 is None or len(kp1) < 8 or len(kp2) < 8:
+        raise RuntimeError("AKAZE: Not enough feature points found for matching.")
+
+    matcher = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)  # For AKAZE
+    # matcher = cv.BFMatcher(cv.NORM_L2, crossCheck=True)  # For SIFT
+    matches = matcher.match(desc1, desc2)
+
+    if len(matches) < 8:
+        raise RuntimeError("AKAZE: Not enough valid matches found.")
+
+    # DEBUG: Amount of keypoints filtered by BF Matcher
+    print(f"Keypoints removed by BF Matcher: {len(kp1) - len(matches)}")
+
+    akaze_pts_left = np.array([kp1[m.queryIdx].pt for m in matches], dtype=np.float32)
+    akaze_pts_right = np.array([kp2[m.trainIdx].pt for m in matches], dtype=np.float32)
+
+    # DEBUG: Number of keypoints found
+    print(f"Found {len(akaze_pts_left)} keypoints.")
+
+    return akaze_pts_left, akaze_pts_right
+
+
+# --------------------------------------------------------------------------------
 def _getEpipolarMask_(Pnts1, Pnts2, calData, Threshold=2.0):
     """
     Computes a mask for corresponding points that fall within a threshold distance
@@ -332,65 +392,74 @@ def _getEpipolarMask_(Pnts1, Pnts2, calData, Threshold=2.0):
     return mask
 
 
-# TODO: doc string
-# TODO: Why is 8 selected as the minimum keypoints here?
-def _getStereoKeyPoints_(leftImg, rightImg, ROI):
-    # Read and normalize the images to be in the range 0-255
-    left_img_gray = sdic.readImage(leftImg, normalize8Bit=True)
-    right_img_gray = sdic.readImage(rightImg, normalize8Bit=True)
+# --------------------------------------------------------------------------------
+def _getSORMask_(points_3d, MeanK=20, StdRatio=2.0):
+    """
+    Return a boolean statistical-outlier-removal mask for (N, 3) points.
 
-    x_start, y_start, w, h = ROI
-    left_mask = np.zeros_like(left_img_gray, dtype=np.uint8)
-    left_mask[y_start:y_start+h, x_start:x_start+w] = 255
+    MeanK:
+        Number of nearest neighbours, excluding the point itself.
+    StdRatio:
+        Standard-deviation multiplier. Lower values reject more points.
 
-    # TODO: Maybe increased threshold to decrease amount of points for better performance?
-    # akaze = cv.xfeatures2d.AKAZE_create(threshold=0.003)
-    akaze = cv.xfeatures2d.AKAZE_create()
-    # akaze = cv.SIFT_create()    # Experiment with SIFT
-    kp1, desc1 = akaze.detectAndCompute(left_img_gray, mask=left_mask)
-    kp2, desc2 = akaze.detectAndCompute(right_img_gray, mask=None)
+    Non-finite points are always rejected. If fewer than three finite
+    points remain, statistical filtering is skipped.
+    """
+    valid = np.isfinite(points_3d).all(axis=1)
+    valid_indices = np.flatnonzero(valid)
+    finite_points = points_3d[valid]
 
-    if desc1 is None or desc2 is None or len(kp1) < 8 or len(kp2) < 8:
-        raise RuntimeError("AKAZE: Not enough feature points found for matching.")
+    if len(finite_points) < 3:
+        return valid
 
-    matcher = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=True)  # For AKAZE
-    # matcher = cv.BFMatcher(cv.NORM_L2, crossCheck=True)  # For SIFT
-    matches = matcher.match(desc1, desc2)
+    k = min(MeanK, len(finite_points) - 1)
+    tree = KDTree(finite_points)
 
-    if len(matches) < 8:
-        raise RuntimeError("AKAZE: Not enough valid matches found.")
+    # The first distance is zero (the query point itself).
+    distances, _ = tree.query(finite_points, k=k+1)
+    mean_distances = distances[:, 1:].mean(axis=1)
 
-    # DEBUG: Amount of keypoints filtered by BF Matcher
-    print(f"Keypoints removed by BF Matcher: {len(kp1) - len(matches)}")
+    threshold = mean_distances.mean() + StdRatio * mean_distances.std()
 
-    akaze_pts_left = np.array([kp1[m.queryIdx].pt for m in matches], dtype=np.float32)
-    akaze_pts_right = np.array([kp2[m.trainIdx].pt for m in matches], dtype=np.float32)
-
-    # DEBUG: Number of keypoints found
-    print(f"Found {len(akaze_pts_left)} keypoints.")
-
-    return akaze_pts_left, akaze_pts_right
+    mask = np.zeros(len(points_3d), dtype=bool)
+    mask[valid_indices] = mean_distances <= threshold
+    return mask
 
 
+# --------------------------------------------------------------------------------
+# TODO: Doc string
 def _filterStereoKeyPoints_(akaze_pts_left, akaze_pts_right, calData):
     if calData is None:
         raise ValueError("Calibration data ('calData') is incorrect or missing.")
 
     # Epipolar filtering
-    mask_epipolar = _getEpipolarMask_(akaze_pts_left, akaze_pts_right, calData, Threshold=50.0)
+    mask_epipolar = _getEpipolarMask_(akaze_pts_left, akaze_pts_right, calData, Threshold=40.0)
     if mask_epipolar is None or np.sum(mask_epipolar) == 0:
         raise RuntimeError("AKAZE: Epipolar filtering failed.")
 
-    # DEBUG: Amount of keypoints filtered by epipolar constraint
-    print(f"Keypoints removed by Epipolar Constraint: {len(akaze_pts_left) - np.sum(mask_epipolar)}")
-
     valid_epi = (mask_epipolar.ravel() == 1)
+
+    # DEBUG: Amount of keypoints filtered by epipolar constraint
+    print(f"Keypoints removed by Epipolar Constraint: {valid_epi.size - np.count_nonzero(valid_epi)}")
+
     akaze_pts_left = akaze_pts_left[valid_epi]
     akaze_pts_right = akaze_pts_right[valid_epi]
+
+    # Triangulate points
+    points_3d, _ = _triangulatePoints_(akaze_pts_left, akaze_pts_right, calData)
+
+    # Statistical outlier removal filtering
+    valid_sor = _getSORMask_(points_3d)
+    akaze_pts_left = akaze_pts_left[valid_sor]
+    akaze_pts_right = akaze_pts_right[valid_sor]
+
+    # DEBUG: Amount of keypoints filtered by statistical outlier removal
+    print(f"Keypoints removed by SOR: {valid_sor.size - np.count_nonzero(valid_sor)}")
 
     return akaze_pts_left, akaze_pts_right
 
 
+# --------------------------------------------------------------------------------
 # TODO: Rewrite to use multiple cores, as each subset is independent.
 # TODO: Maybe vectorise it and use workers=N_CORES
 def _estimateSubSetsAkaze_(subSetPnts_left, subSetPnts_right, akaze_left, akaze_right, N_neighbors, search_radius):
@@ -494,6 +563,7 @@ def _estimateSubSetsAkaze_(subSetPnts_left, subSetPnts_right, akaze_left, akaze_
     return subSetPnts_right
 
 
+# --------------------------------------------------------------------------------
 # TODO: Rewrite so that it supports multiple strategies
 # TODO: Rewrite so that it will perform stereo matching using existing subsets
 #       i.e.: stereo match each stereo image pair
@@ -600,7 +670,8 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     sdic._toc_()
 
     # DEBUG: Plot keypoints in 3D
-    # plotPoints3D(points_3d, fileName="keypoints_3d.png", showPlot=True, set_aspect="equal")
+    points_3d, _ = _triangulatePoints_(akaze_left, akaze_right, calData)
+    plotPoints3D(points_3d, fileName="keypoints_3d.png", showPlot=True, set_aspect="equal")
 
     # Estimate right image subset parameters using keypoints
     print("Estimate right image subset parameters")
@@ -609,9 +680,6 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     sdic._tic_()
     initSubSetPnts_right = _estimateSubSetsAkaze_(initSubSetPnts_left, None, akaze_left, akaze_right, N_neighbors, search_radius)
     sdic._toc_()
-
-    # Create and export 3D mesh
-    # _ = _createMesh3D_(points_3d, export=True)
 
     # DEBUG: Plot initial right image subset points before matching
     plotSubSetsOnImage(rightImg,
@@ -622,7 +690,6 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
                        title="Initial right image subset estimates",
                        fileName="initSubSetPnts_right.png",
                        showPlot=True)
-    # breakpoint()
 
     # Perform temporal matching to get the right image subset coordinates and
     # displacements
@@ -675,6 +742,7 @@ def stereoMatch(settings, calData, leftImg, rightImg, fillMissing=False):
     return leftSubSetPnts, rightSubSetPnts
 
 
+# --------------------------------------------------------------------------------
 # TODO: Add option to set calibration parameters location in settings file. The
 # parameters should be stored in a csv file in the required format.
 # For now, first get the calibration data outside the function by performing
@@ -789,6 +857,9 @@ def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
         worldSubSetPnts_out[:, :, StereoCompID.YDispID] = worldSubSetPnts[:, :, StereoCompID.YCoordID] - worldSubSetPnts_ref[:, :, StereoCompID.YCoordID]
         worldSubSetPnts_out[:, :, StereoCompID.ZDispID] = worldSubSetPnts[:, :, StereoCompID.ZCoordID] - worldSubSetPnts_ref[:, :, StereoCompID.ZCoordID]
 
+        # Update the reprojection error
+        worldSubSetPnts_out[:, :, StereoCompID.ProjErrID] = (worldSubSetPnts[:, :, StereoCompID.ProjErrID])
+
         # TODO: Figure out if the subset coordinates are ever updated in SUN-DIC, as it doesn't seem so
         # Update coordinates from triangulation
         # worldSubSetPnts_out[:, :, CompID.XCoordID] = worldSubSetPnts[:, :, CompID.XCoordID]
@@ -808,6 +879,7 @@ def stereoDICLocal(settings, calData, resultsFile, fillMissing=False):
     return returnData
 
 
+# --------------------------------------------------------------------------------
 # The following function has been generated using Gemini.
 # TODO: Implement into sundic postprocessing
 def plotSubSetsOnImage(img, subSetPnts, applyDeformation=True, showCenters=True, maxSubSets=None, title="DIC Subsets on Image", fileName="subsets.png", showPlot=True):
@@ -929,6 +1001,7 @@ def plotSubSetsOnImage(img, subSetPnts, applyDeformation=True, showCenters=True,
     return fig, ax
 
 
+# --------------------------------------------------------------------------------
 def plotStereoSubSets2D(leftSubSetPnts, rightSubSetPnts, fileName="subset_points_2d.png", showPlot=False):
     """
     Plot both the leftSubSetPnts and rightSubSetPnts on a 2D scatter plot.
@@ -972,6 +1045,7 @@ def plotStereoSubSets2D(leftSubSetPnts, rightSubSetPnts, fileName="subset_points
     return fig
 
 
+# --------------------------------------------------------------------------------
 def plotSubSets3D(worldSubSetPnts, fileName="subset_points_3d.png", showPlot=False, set_aspect="auto"):
     """
     Plot the worldSubSetPnts on a 3D scatter plot.
@@ -1029,6 +1103,7 @@ def plotSubSets3D(worldSubSetPnts, fileName="subset_points_3d.png", showPlot=Fal
     return fig, ax
 
 
+# --------------------------------------------------------------------------------
 def plotDispContour3D(worldSubSetPnts,
                       dispComp="z",
                       fileName="displacement_contour_3d.png",
@@ -1113,6 +1188,7 @@ def plotDispContour3D(worldSubSetPnts,
     return fig, ax
 
 
+# --------------------------------------------------------------------------------
 def plotPoints3D(points_3d, fileName="points_3d.png", showPlot=False, set_aspect="auto"):
     """
     Plot 3D triangulated keypoints on a scatter plot.
